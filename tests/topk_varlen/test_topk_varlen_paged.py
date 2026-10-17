@@ -173,9 +173,11 @@ def test_paged_main_register_rows(rows, ncols, top_k, page_size):
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
     gen = torch.Generator(device=_DEV).manual_seed(rows + page_size)
     lens = torch.randint(top_k + 1, cap + 1, (rows,), generator=gen, device=_DEV)
-    # band edges, the VPT 2 / VPT 4 boundary, a short row, a streaming row
+    # band edges, the VPT 2 / VPT 4 boundary, a short row, a streaming row, and
+    # the 512-thread rung's band (K <= 1024: k < n <= 2048) with its edges
     lens[0], lens[1], lens[2], lens[3] = cap, cap + 1, top_k, ncols
     lens[4], lens[5] = cap // 2, cap // 2 + 1
+    lens[6], lens[7], lens[8] = top_k + 1, 2048, 2049
     lens = lens.to(torch.int32)
     pt = _page_table(rows, ncols, page_size, seed=41)
     loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
