@@ -1061,6 +1061,11 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     tpl = tuple(plan["tpl"])  # (BLK, U, MINB, SNB, KPT, SPLIT, TSHG)
     rt = plan["rt"]
     r_const = rt["R"]
+    # SPLIT with two or more rows on U = 8 engines (8192-float4 tiles, which a
+    # row near the envelope needs several of per part): the kernel may deal
+    # the CTAs out by length (GvrMainKernel._split_parts). It holds one row per
+    # lane and scans the 148 // R rows a SPLIT plan can have, at most 32.
+    balance = bool(tpl[5]) and tpl[1] == 8 and 2 <= num_rows and num_rows * r_const <= 148
     # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
     # machinery in whenever SPLIT); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
@@ -1070,6 +1075,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
             hint_free=hint_free,
             pt_smem=pt_smem,
             pdl=_DECODE_PDL,
+            balance=balance,
             **pg,
         )
     )

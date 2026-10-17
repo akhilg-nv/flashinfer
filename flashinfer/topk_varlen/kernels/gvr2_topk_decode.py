@@ -1456,6 +1456,7 @@ class GvrMainKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         pdl: bool = False,
+        balance: bool = False,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1543,6 +1544,13 @@ class GvrMainKernel:
         # longer rows into parts of half a tile (see the varlen prologue)
         self.solo_f4 = max(blk * u, self.scpb >> 2)
         self.part_f4 = blk // 2 if (u == 1 and self.r_const >= 128) else 0
+        # SPLIT launches of two or more rows (decode; the host enables it on
+        # U = 8 engines) deal the CTAs out by length when a row's R parts would
+        # span several tiles (`_split_parts`). R >= 128 engines launch a single
+        # row and keep the half-tile parts above.
+        self.balance = (
+            bool(balance) and self.split and self.varlen and not self.prefill and self.part_f4 == 0
+        )
         # smem blob byte map: cbuf/cbuf2 alias @0,
         # ck64 @ 4*(VSTG ? 2*(SCPB+4) : SCPB+4), size (CMPB+1)*8
         self.ck_off = 4 * ((2 * (self.scpb + 4)) if self.vstg else (self.scpb + 4))
@@ -1625,7 +1633,11 @@ class GvrMainKernel:
 
     # ---- paged output (page table in the pre_idx slot of a hint-free compile) ----
     def _pt_req(self):
-        # request of this CTA's row, re-derived from the block index (no live register)
+        # request of this CTA's row, re-derived from the block index (no live
+        # register); with SPLIT parts dealt out by length, the row _split_parts
+        # gave this CTA (warp-uniform, so it sits in a uniform register)
+        if self.balance:
+            return self._split_row // cutlass.Int32(self.next_n)
         bx, by, _ = cute.arch.block_idx()
         return by // cutlass.Int32(self.next_n)
 
@@ -1646,6 +1658,106 @@ class GvrMainKernel:
                 v & cutlass.Int32((1 << ps) - 1)
             )
         return self._ox_g(pre_idx, v)
+
+    @cute.jit
+    def _split_parts(self, kv_lens, n, k, lane):
+        """SPLIT, two or more rows: whether to deal the batch's CTAs out by
+        length and, if so, this CTA's (row, part, parts of the row, live length,
+        float4s per part) from _split_table.
+
+        grid.x = R and U come from the capture-time envelope, so a row near the
+        envelope takes several tiles per part while the parts of the short rows
+        beside it idle. Only then (some row longer than BLK * U * R float4s,
+        and some row at most half that, whose parts are spare) are the CTAs
+        dealt out by length, which shrinks the long row's parts to about one
+        tile; otherwise every row keeps its own R CTAs (the per-row prologue).
+        Measured on B200: with U = 8 a second tile per part is another 128 KB
+        stream per CTA, and dealing the parts out cut 1M-column rows among
+        short ones by up to 22% (V4.1 c1) and 35% (GLM-5.2); with U <= 4 the
+        extra tiles are short and prefetched, so it gained nothing, and
+        re-splitting rows that already fit one tile was slower. Lane j of each
+        warp holds row j (rows * R <= 148, so rows <= 32), so every warp makes
+        the same choice without a barrier."""
+        rows = cute.arch.grid_dim()[1]
+        nj = cutlass.Int32(0)
+        if lane < rows:  # the varlen prologue's row length, for row = lane
+            nj = (
+                kv_lens[lane // cutlass.Int32(self.next_n)]
+                - cutlass.Int32(self.next_n)
+                + lane % cutlass.Int32(self.next_n)
+                + cutlass.Int32(1)
+            ) >> cutlass.Int32(self.cr_shift)
+            if nj < cutlass.Int32(0):
+                nj = cutlass.Int32(0)
+            if nj > n:
+                nj = n
+        n4j = nj >> cutlass.Int32(2)
+        tile_r = self.blk * self.u * self.r_const  # float4s R one-tile parts cover
+        sp = cutlass.Int32(0)
+        if lane < rows:
+            if n4j * cutlass.Int32(2) <= cutlass.Int32(tile_r):
+                sp = cutlass.Int32(1)
+        bal = cutlass.Int32(0)
+        if C.ballot(n4j > cutlass.Int32(tile_r)) != cutlass.Int32(0):
+            if C.ballot(sp != cutlass.Int32(0)) != cutlass.Int32(0):
+                bal = cutlass.Int32(1)
+        row = cutlass.Int32(0)
+        part = cutlass.Int32(0)
+        r_eff = cutlass.Int32(0)
+        nv = cutlass.Int32(0)
+        q = cutlass.Int32(0)
+        if bal != cutlass.Int32(0):
+            wj = cutlass.Int32(0)  # float4s of a long row, 0 for one-part rows
+            if nj > k:
+                if n4j > cutlass.Int32(self.solo_f4):
+                    wj = n4j
+            bx, by, _ = cute.arch.block_idx()
+            cta = by * cutlass.Int32(self.r_const) + bx
+            row, part, r_eff, nv, q = self._split_table(rows, cta, nj, wj, lane)
+        return bal, row, part, r_eff, nv, q
+
+    @cute.jit
+    def _split_table(self, rows, cta, nj, wj, lane):
+        """The batch's CTAs dealt out by length (for _split_parts, with a long
+        row present): each row takes one CTA and the long rows share the other
+        rows * (R - 1) in proportion to their float4s. Row j owns the linear
+        CTA ids [j + F(lo_j), j + 1 + F(hi_j)), lo_j / hi_j the exclusive /
+        inclusive prefix sums of the long rows' float4s, F(x) = floor(rows *
+        (R - 1) * x / total + 1/64): the cumulative floors hand out exactly
+        rows * R CTAs, at least one per row. fp32 is exact enough (F's argument
+        is at most 148 and off by < 1e-4, which the 1/64 bias absorbs), and all
+        CTAs run the same instructions, so they agree. Q = ceil(n4 / parts)
+        with no integer division: (n4 + parts - 1/2) / parts is at least
+        1 / (2 parts) from an integer, far above the fp32 error for n4 < 2^20."""
+        sc = cutlass.Float32(rows * cutlass.Int32(self.r_const - 1)) * cute.arch.rcp_approx(
+            cutlass.Float32(cute.arch.warp_redux_sync(wj, "add"))
+        )
+        hi = wj  # inclusive prefix sum over the 148 // R rows a launch can have
+        for o in [1, 2, 4, 8, 16]:
+            if cutlass.const_expr(o < min(148 // self.r_const, 32)):
+                hi = C._shfl_up_add(hi, lane, o)
+        lo = lane + cutlass.Int32(cutlass.Float32(hi - wj) * sc + cutlass.Float32(1.0 / 64.0))
+        hi = lane + cutlass.Int32(1) + cutlass.Int32(cutlass.Float32(hi) * sc + cutlass.Float32(1.0 / 64.0))
+        cnt = hi - lo
+        qj = nj >> cutlass.Int32(2)
+        if cnt > cutlass.Int32(1):
+            qj = cutlass.Int32(
+                (cutlass.Float32(qj + cnt) - cutlass.Float32(0.5))
+                * cute.arch.rcp_approx(cutlass.Float32(cnt))
+            )
+        mine = cutlass.Int32(0)
+        if lane < rows:
+            if cta >= lo:
+                if cta < hi:
+                    mine = cutlass.Int32(1)
+        return (
+            cute.arch.warp_redux_sync(lane * mine, "add"),
+            cute.arch.warp_redux_sync((cta - lo) * mine, "add"),
+            cute.arch.warp_redux_sync(cnt * mine, "add"),
+            cute.arch.warp_redux_sync(nj * mine, "add"),
+            cute.arch.warp_redux_sync(qj * mine, "add"),
+        )
+
     @cute.kernel
     def kern(
         self,
@@ -1758,6 +1870,15 @@ class GvrMainKernel:
                 # (same clamp the reg / reg_clus / clus varlen prologues apply).
                 if nv > n:
                     nv = n
+                if cutlass.const_expr(self.balance):
+                    # a row near the envelope beside short rows: this CTA's row,
+                    # part and the row's part count come from the whole batch
+                    bal, row_b, part_b, r_bal, nv_b, q_bal = self._split_parts(kv_lens, n, k, lane)
+                    if bal != cutlass.Int32(0):
+                        row = row_b
+                        part = part_b
+                        nv = nv_b
+                    self._split_row = row
             n_row = nv
             if nv <= k:
                 short = cutlass.Int32(1)
@@ -1813,6 +1934,10 @@ class GvrMainKernel:
                     if n4v <= cutlass.Int32(self.solo_f4):
                         r_eff = cutlass.Int32(1)
                         Q = n4v
+                    if cutlass.const_expr(self.balance):
+                        if bal != cutlass.Int32(0):
+                            r_eff = r_bal  # dealt out by length (_split_parts)
+                            Q = q_bal
                     # Parts past r_eff own no columns: they leave through the
                     # short-row exits (no ladder, no body, and the identity
                     # epilogue is part 0's), so they never touch the slab.
@@ -1902,7 +2027,7 @@ class GvrMainKernel:
                 byte_alignment=16,
             )
             npg = cutlass.Int32(pre_idx.shape[1])
-            req_pt = self._pt_req()
+            req_pt = row // cutlass.Int32(self.next_n)
             jp = tidx
             while jp < cutlass.Int32(self.pt_smem):
                 ent = cutlass.Int32(-1)
@@ -3445,6 +3570,7 @@ def get_compiled(
     page_shift: int = 0,
     pt_smem: int = 0,
     pdl: bool = False,
+    balance: bool = False,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3458,7 +3584,11 @@ def get_compiled(
     so it is part of the cache key and the persist name; the compile retypes
     the pre_idx ABI slot to a 1-D align-4 fake (it carries row_starts; the
     kv_lens slot carries the window lengths and ke = ks + len is formed on
-    device)."""
+    device).
+
+    ``balance`` (decode SPLIT tuple, launches of two or more rows) deals a
+    mixed batch's SPLIT CTAs out by length when a row's R parts would span
+    several tiles (``GvrMainKernel._split_parts``)."""
     prefill_abs = bool(prefill_abs) and bool(prefill)
     paged = bool(paged)
     if paged and not (hint_free and len(tpl) == 10 and not prefill):
@@ -3473,6 +3603,7 @@ def get_compiled(
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
         bool(pdl),
+        bool(balance),
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3506,6 +3637,7 @@ def get_compiled(
             page_shift=int(page_shift) if paged else 0,
             pt_smem=int(pt_smem) if paged else 0,
             pdl=bool(pdl),
+            balance=bool(balance),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3569,6 +3701,8 @@ def get_compiled(
             name += f"_pts{int(pt_smem)}"
     if pdl:
         name += "_pdl1"
+    if balance:
+        name += "_bal1"
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled

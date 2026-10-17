@@ -848,6 +848,190 @@ def test_gvr2_split_cuda_graph_replay_live_parts(rows, msl_c, top_k, page_size):
         ), f"paged replay mismatch: {kv}"
 
 
+def _balanced_split_compiled(r):
+    """A U = 8 SPLIT main engine of R = r parts with the by-length part
+    assignment sits in the compile cache (key: tpl, options, hint_free, prefill,
+    prefill_abs, paged, page_shift, pt_smem, pdl, balance, arch)."""
+    return any(
+        len(key[0]) == 10 and key[0][5] and key[0][1] == 8 and key[0][9] == r and key[9]
+        for key in _host._device()._COMPILE_CACHE
+    )
+
+
+def _balanced_row_plans(rows, msl_c, top_k, solo):
+    """Per-row compressed lengths for the SPLIT part assignment (``solo`` = the
+    engine's one-part bound in columns). Rows next to an envelope-length row
+    get their CTAs dealt out by length (the envelope row's R parts would span
+    several tiles), the others keep their own R CTAs: rows on both sides of
+    the one-part bound, one envelope row among short ones (it takes every
+    spare CTA) at either end, every row short (the parts past each row idle),
+    long rows of very different lengths (the shortest get one part), equal
+    long rows (the R-way split) and two equal long rows next to short ones."""
+    short = [top_k // 2, top_k, 0, top_k - 1]
+    edge = [solo, solo + 4, solo - 4, solo + 1, solo + 7, top_k + 1, msl_c, solo + 3]
+    plans = [
+        [edge[j % len(edge)] for j in range(rows)],
+        [msl_c] + [short[j % 4] for j in range(rows - 1)],
+        [short[j % 4] for j in range(rows - 1)] + [msl_c - 3],
+        [short[j % 4] for j in range(rows)],
+        [solo + 4 if j % 3 else msl_c for j in range(rows)],
+        [msl_c - 4 * j for j in range(rows)],
+        [msl_c // 2 if j < 2 else top_k // 2 for j in range(rows)],
+    ]
+    return [p for p in plans if max(p) <= msl_c]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k,next_n,cr,solo,page_size",
+    [
+        (8, 1048832, 512, 1, 1, 32768, 128),  # V4.1 c1 width: R = 18, U = 8, paged
+        (16, 1048832, 512, 1, 1, 32768, None),  # R = 9, U = 8
+        (16, 524416, 512, 1, 1, 32768, None),  # V4.1 c2 width: R = 9, U = 8
+        (8, 1048640, 2048, 1, 1, 32768, 64),  # GLM-5.2 width, K = 2048: R = 18, paged
+        (32, 1048640, 2048, 2, 1, 32768, None),  # next_n = 2: R = 4, U = 8
+        (4, 262208, 1024, 1, 4, 8192, None),  # DSv4 c4 (cr = 4): R = 37, U = 1, per-row parts
+    ],
+)
+def test_gvr2_split_balanced_mixed_rows(rows, msl_c, top_k, next_n, cr, solo, page_size):
+    """On U = 8 SPLIT engines, when a row near the envelope would take several
+    tiles per part, the batch's CTAs are dealt out by length (one per row, the
+    rest shared by the long rows), so a CTA's (row, part) and the row's part
+    count follow the whole batch's lengths; otherwise each row keeps its own R
+    CTAs (always, on the U = 1 engine). Mixed batches on both paths (rows
+    around the one-part bound, one envelope row among short ones, all rows
+    short, long rows of very different lengths), hinted and hint-free, must
+    stay exact; paged output must map through the right request's page
+    table."""
+    assert rows % next_n == 0
+    plans = _balanced_row_plans(rows // next_n, msl_c, top_k, solo)
+    shift = None if page_size is None else page_size.bit_length() - 1
+    for i, plan in enumerate(plans):
+        kv = [n * cr + next_n - 1 for n in plan]
+        logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+            kv, next_n, cr, top_k, seed=100 * rows + i, msl_c=msl_c
+        )
+        for hint_free in (False, True):
+            indices, _ = _run_gvr2(
+                logits,
+                seq_lens,
+                top_k,
+                None if hint_free else pre_idx,
+                next_n=next_n,
+                compress_ratio=cr,
+            )
+            _check_varlen_rows(logits, indices, n_r, top_k)
+        assert _split_parts(rows, msl_c, top_k, next_n, cr, True) > 1
+        if page_size is None:
+            continue
+        pages = (msl_c + page_size - 1) // page_size
+        gen = torch.Generator(device=_DEV).manual_seed(i)
+        pt = torch.stack(
+            [
+                torch.randperm(4 * pages + 7, generator=gen, device=_DEV)[:pages]
+                for _ in range(rows // next_n)
+            ]
+        ).to(torch.int32)
+        out, _ = _run_gvr2(
+            logits,
+            seq_lens,
+            top_k,
+            None,
+            next_n=next_n,
+            compress_ratio=cr,
+            page_table=pt,
+            page_size=page_size,
+        )
+        l64 = indices.to(torch.int64)
+        req = (torch.arange(rows, device=_DEV) // next_n).unsqueeze(1)
+        phys = (pt.to(torch.int64)[req, (l64 >> shift).clamp_min(0)] << shift) | (
+            l64 & (page_size - 1)
+        )
+        want = torch.where(indices >= 0, phys.to(torch.int32), indices)
+        assert torch.equal(
+            torch.sort(out, dim=1).values, torch.sort(want, dim=1).values
+        ), f"paged mismatch: {plan}"
+        assert _split_parts(rows, msl_c, top_k, next_n, cr, True, shift) > 1
+    r = _split_parts(rows, msl_c, top_k, next_n, cr, True)
+    # a one-part bound of 32768 columns is BLK * U * 4 with U = 8
+    assert _balanced_split_compiled(r) == (solo == 32768)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k,solo,page_size",
+    [
+        (8, 1048832, 512, 32768, 128),  # V4.1 c1 width: R = 18, U = 8, paged
+        (16, 1048832, 512, 32768, None),  # R = 9, U = 8
+        (8, 1048640, 2048, 32768, None),  # GLM-5.2 width, K = 2048: R = 18
+        (32, 1048640, 2048, 32768, 64),  # R = 4, U = 8, paged
+    ],
+)
+def test_gvr2_split_balanced_graph_replay(rows, msl_c, top_k, solo, page_size):
+    """The part assignment is re-derived from seq_lens at every replay:
+    capture once, then rewrite the lengths so that CTAs move between rows and
+    between the two paths (one envelope row taking every spare CTA, at either
+    end; all rows short; equal long rows; mixed). Every replay must be exact
+    and must leave the slab's arrival counters at zero."""
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    logits = torch.randn(rows, msl_c, generator=gen, device=_DEV) - 2.0
+    seq_lens = torch.full((rows,), msl_c, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ws = torch.zeros(_host.workspace_bytes() // 4, dtype=torch.int32, device=_DEV)
+    kw = dict(out_indices=out, workspace={"gvr2_workspace": ws})
+    pt = None
+    if page_size is not None:
+        pages = (msl_c + page_size - 1) // page_size
+        pt = torch.stack(
+            [
+                torch.randperm(4 * pages + 7, generator=gen, device=_DEV)[:pages]
+                for _ in range(rows)
+            ]
+        ).to(torch.int32)
+        kw.update(page_table=pt, page_size=page_size)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        _run_gvr2(logits, seq_lens, top_k, None, **kw)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    shift = None if page_size is None else page_size.bit_length() - 1
+    assert _split_parts(rows, msl_c, top_k, 1, 1, True, shift) > 1
+    plans = _balanced_row_plans(rows, msl_c, top_k, solo)
+    plans = plans + [[msl_c] * rows] + plans[::-1]
+    for kv in plans:
+        seq_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
+        logits.normal_(generator=gen)
+        n_r = _row_valid_lens(kv, rows, 1, 1, msl_c)
+        for r in range(rows):
+            logits[r, n_r[r] :] = 3e38
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        assert int(ws[: 2048 // 4].abs().sum()) == 0, f"slab counters left set: {kv}"
+        if pt is None:
+            _check_varlen_rows(logits, out, n_r, top_k)
+            continue
+        loc, _ = _run_gvr2(logits, seq_lens, top_k, None)
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits, loc, n_r, top_k)
+        l64 = loc.to(torch.int64)
+        req = torch.arange(rows, device=_DEV).unsqueeze(1)
+        phys = (pt.to(torch.int64)[req, (l64 >> shift).clamp_min(0)] << shift) | (
+            l64 & (page_size - 1)
+        )
+        want = torch.where(loc >= 0, phys.to(torch.int32), loc)
+        assert torch.equal(
+            torch.sort(out, dim=1).values, torch.sort(want, dim=1).values
+        ), f"paged replay mismatch: {kv}"
+    assert _balanced_split_compiled(_split_parts(rows, msl_c, top_k, 1, 1, True, shift))
+
+
 # ---------------------------------------------------------------------------
 # backend registration / guards / cross-backend
 # ---------------------------------------------------------------------------
