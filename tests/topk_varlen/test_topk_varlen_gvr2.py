@@ -4060,11 +4060,11 @@ def test_gvr2_small_row_sample_gate():
     assert g(2048, False, 1, 2816, False) == 1
     assert g(512, False, 1, 768, False) == 0 and g(2048, True, 1, 8192, False) == 0
     # hint-free, one CTA per row: rows longer than aim (the kernel floors sd_en
-    # at 2k): the one-wave slab (aim 2k at K = 512, 4k above) and the 256/512-
-    # thread slabs (aim below 2k)
+    # at 2k): the one-wave slab (aim 2k at K = 512, 7k/4 above) and the 256/512-
+    # thread slabs (aim 7k/4)
     assert g(512, True, 1, 1024, True) == 1024
-    assert g(1024, True, 1, 4096, True) == 4096
-    assert g(2048, True, 1, 8192, True) == 8192
+    assert g(1024, True, 1, 1792, True) == 1792
+    assert g(2048, True, 1, 3584, True) == 3584
     assert g(512, False, 1, 768, True) == 768
     # hint-free SPLIT: off; its rows up to 16384 columns, above SCAP (8192),
     # take the in-kernel register path
@@ -4077,8 +4077,8 @@ def test_gvr2_small_row_sample_gate():
     "rows,ncols,top_k,want_hint_free,want_hinted",
     [
         (128, 131072, 512, 1024, 0),  # one-wave slab, K=512 (aim 2k)
-        (128, 131072, 1024, 4096, 0),  # one-wave slab, K=1024 (aim 4k)
-        (64, 131072, 2048, 8192, 0),  # one-wave slab, K=2048 (aim 4k)
+        (128, 131072, 1024, 1792, 0),  # one-wave slab, K=1024 (aim 7k/4: floored at 2k)
+        (64, 131072, 2048, 3584, 0),  # one-wave slab, K=2048 (aim 7k/4: floored at 2k)
         (160, 131072, 512, 896, 0),  # two-CTA slab (aim 7k/4: floored at 2k)
         (160, 131072, 2048, 3584, 1),  # two-CTA slab, K > 1024 (aim 7k/4)
         (4, 262144, 512, 0, 0),  # SPLIT slab: off (register path)
@@ -4108,19 +4108,23 @@ def test_gvr2_launcher_small_row_sample(
     [
         # below the register-path envelope gate (_MAIN_REG_ENV), which would
         # rank all of these rows with the register body
-        (128, 130944, 1024),  # one-wave slab: threshold aim = 4096
-        (64, 130944, 2048),  # one-wave slab, K=2048: threshold aim = 8192
+        (128, 130944, 1024),  # one-wave slab: aim 1792, sampled above 2k
+        (64, 130944, 2048),  # one-wave slab, K=2048: aim 3584, sampled above 2k
+        (148, 130944, 512),  # one-wave slab, K=512: aim 2k
     ],
 )
 def test_gvr2_small_row_sample_threshold_edges(rows, cap_c, top_k):
     """Hint-free rows on both sides of the launch's small-row sample threshold
-    (sampled above it, unsampled at or below it) rank exactly, mixed with rows
-    on the 2k floor and the SCAP edge, at a capacity far above every row."""
+    max(2k, sd_en) (sampled above it, unsampled at or below it) rank exactly,
+    mixed with rows on the 4k and 8k marks and the SCAP edge, at a capacity far
+    above every row. The one-wave slab's aim (sd_en) is at most 2k, so its
+    threshold is the 2k floor."""
     lc = _host._varlen_launcher(rows, cap_c, top_k, cap_c, 1, 1, True, None)
-    thr = lc[3][3]
-    assert 2 * top_k < thr < 16384, lc[3]
+    assert 0 < lc[3][3] <= 2 * top_k, lc[3]
+    thr = 2 * top_k
     assert _main_reg_cap(rows, cap_c, top_k) == 0  # streamed, not register rows
-    edges = [thr, thr + 1, thr - 1, thr + 4, 2 * top_k + 1, 8192, 8196]
+    edges = [thr, thr + 1, thr - 1, thr + 4, 4 * top_k, 4 * top_k + 1, 8192, 8196]
+    edges += [16384, 16385]
     cols = [edges[r % len(edges)] for r in range(rows)]
     logits, seq_lens, _, n_r, _ = _make_varlen_case(
         cols, 1, 1, top_k, seed=rows + top_k, msl_c=cap_c
