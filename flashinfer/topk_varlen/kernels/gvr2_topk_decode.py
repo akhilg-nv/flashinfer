@@ -1010,9 +1010,20 @@ def scan_cross(
 # barrier. EXACTLY ONE internal barrier. The second stage is TWO REDUCTIONS,
 # not a scan: tot = redux_add(vv), off = redux_add((lane < wid) ? vv : 0) —
 # wid is warp-uniform so the masked operand stays convergent.
+# bar > 0: the barrier is named barrier `bar` over the blk threads (see
+# GvrTopkRegKernel `bar_id`).
 # ===========================================================================
 @cute.jit
-def scan_cross_w(s_hist, s_ws, target, tidx, s_res, blk: cutlass.Constexpr, nb: cutlass.Constexpr):
+def scan_cross_w(
+    s_hist,
+    s_ws,
+    target,
+    tidx,
+    s_res,
+    blk: cutlass.Constexpr,
+    nb: cutlass.Constexpr,
+    bar: cutlass.Constexpr = 0,
+):
     BPT = nb // blk
     NW = blk // 32
     lane = tidx & cutlass.Int32(31)
@@ -1026,7 +1037,10 @@ def scan_cross_w(s_hist, s_ws, target, tidx, s_res, blk: cutlass.Constexpr, nb: 
     w = warp_incl_scan_add(sm, lane)
     if lane == cutlass.Int32(31):
         s_ws[wid] = w
-    cute.arch.barrier()  # the ONE internal barrier
+    if cutlass.const_expr(bar):
+        cute.arch.barrier(barrier_id=bar, number_of_threads=blk)
+    else:
+        cute.arch.barrier()  # the ONE internal barrier
     vv = cutlass.Int32(0)
     if lane < cutlass.Int32(NW):
         vv = s_ws[lane]
@@ -3937,6 +3951,7 @@ class GvrTopkRegKernel:
         pt_smem: int = 0,
         stage_out: bool = True,
         embedded: bool = False,
+        bar_id: int = 0,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
@@ -3948,6 +3963,11 @@ class GvrTopkRegKernel:
         # rank, row) grid carries the row on block_idx.y.
         self.embedded = bool(embedded)
         assert not (self.embedded and (pdl or prefill))
+        # bar_id > 0 (embedded only): the body runs on the first BLK threads of a
+        # wider CTA whose other threads have left, so every barrier is named
+        # barrier bar_id over BLK threads instead of the CTA-wide bar.sync 0.
+        self.bar_id = int(bar_id)
+        assert self.bar_id == 0 or (self.embedded and 0 < self.bar_id < 16)
         self.blk = blk
         self.vpt = vpt
         self.minb = minb
@@ -4042,6 +4062,14 @@ class GvrTopkRegKernel:
                 v & cutlass.Int32((1 << ps) - 1)
             )
         return self._ox_g(pre_idx, v)
+
+    def _sync(self):
+        """The body's CTA barrier (named over BLK threads with ``bar_id``)."""
+        if self.bar_id:
+            cute.arch.barrier(barrier_id=self.bar_id, number_of_threads=self.blk)
+        else:
+            cute.arch.barrier()
+
     @cute.kernel
     def kern(
         self,
@@ -4430,7 +4458,7 @@ class GvrTopkRegKernel:
                         _sts128_f32(fatom, frags[u], ck_base, i * cutlass.Int32(16))
                 if tid < ntail:
                     img_f[tix] = tval
-                cute.arch.barrier()  # image staged
+                self._sync()  # image staged
                 for t in cutlass.range_constexpr(KPT):
                     p = pvs[t]
                     if cutlass.Uint32(p) < cutlass.Uint32(n):
@@ -4441,14 +4469,14 @@ class GvrTopkRegKernel:
                                 lmin = uk
                             if uk > lmax:
                                 lmax = uk
-                cute.arch.barrier()  # img dies
+                self._sync()  # img dies
             elif cutlass.const_expr(self.use_bm):
                 nbw = (n + cutlass.Int32(31)) >> cutlass.Int32(5)
                 i = tid
                 while i < nbw:  # bitmap clear
                     bm[i] = cutlass.Int32(0)
                     i = i + cutlass.Int32(BLK)
-                cute.arch.barrier()  # bitmap cleared
+                self._sync()  # bitmap cleared
                 for t in cutlass.range_constexpr(KPT):
                     p = pvs[t]
                     if cutlass.Uint32(p) < cutlass.Uint32(n):
@@ -4456,7 +4484,7 @@ class GvrTopkRegKernel:
                             bm.iterator + (p >> cutlass.Int32(5)),
                             cutlass.Int32(1) << (p & cutlass.Int32(31)),
                         )
-                cute.arch.barrier()  # bitmap set
+                self._sync()  # bitmap set
                 lmn = cutlass.Float32(_POS_INF)
                 lmx = cutlass.Float32(_NEG_INF__reg)
                 for u in cutlass.range_constexpr(VPT):
@@ -4482,7 +4510,7 @@ class GvrTopkRegKernel:
                             lmx = fmax_f32(lmx, tval)
                 lmin = fkey(lmn)
                 lmax = fkey(lmx)  # monotone
-                cute.arch.barrier()  # bm dies
+                self._sync()  # bm dies
             elif cutlass.const_expr(self.hf_fold):
                 # hint-free bracket (VPT == 1): min/max over the first k row
                 # values this thread already holds in its register float4
@@ -4545,7 +4573,7 @@ class GvrTopkRegKernel:
             if lane == cutlass.Int32(0):
                 s_wmn[tid >> cutlass.Int32(5)] = lmin
                 s_wmx[tid >> cutlass.Int32(5)] = lmax
-            cute.arch.barrier()  # warp partials published
+            self._sync()  # warp partials published
             a = cutlass.Uint32(0xFFFFFFFF)
             c = cutlass.Uint32(0)
             if lane < cutlass.Int32(NW):
@@ -4641,14 +4669,16 @@ class GvrTopkRegKernel:
                 qt = _submul_asm(tval, Tv, SC)
                 if qt >= cutlass.Float32(0.0):
                     _red_shared_add1__reg(hb + (f2s_rz(fmin_f32(qt, QCAPf)) << cutlass.Int32(2)))
-            cute.arch.barrier()  # histogram done
+            self._sync()  # histogram done
 
             # ---- crossing-bin find
             if cutlass.const_expr(self.cur or self.nbh > 1024):
-                scan_cross_w(s_hist, s_ws, k, tid, s_res, blk=self.blk, nb=self.nbh)
+                scan_cross_w(
+                    s_hist, s_ws, k, tid, s_res, blk=self.blk, nb=self.nbh, bar=self.bar_id
+                )
             else:
                 find_cross(s_hist, k, tid, s_res, nb=self.nbh)
-            cute.arch.barrier()  # crossing published
+            self._sync()  # crossing published
             above = s_res[RES_ABOVE]
             m = s_res[RES_M]
             Bv = s_res[RES_B]
@@ -4710,7 +4740,7 @@ class GvrTopkRegKernel:
                     # dropped. Barrier count unchanged.
                     s_e12[0] = cutlass.Int32(0)
                     s_e12[1] = cutlass.Int32(0)
-                cute.arch.barrier()  # escape init
+                self._sync()  # escape init
                 # Vector-lane bound: the register batch holds real data only
                 # below 4*n4 — lanes in [4*n4, n) are the -inf FILL of the
                 # last partial float4 (the real values there live in tval).
@@ -4756,7 +4786,7 @@ class GvrTopkRegKernel:
                             sh2 = b2w - cutlass.Int32(LNBH)
                         for z in cutlass.range_constexpr(self.nbh // self.blk):
                             s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
-                        cute.arch.barrier()  # esc level clear
+                        self._sync()  # esc level clear
                         for s in cutlass.range_constexpr(S):
                             ix = (
                                 (tid + cutlass.Int32((s // 4) * self.blk)) << cutlass.Int32(2)
@@ -4788,12 +4818,21 @@ class GvrTopkRegKernel:
                                     atomic_add_cta(
                                         s_hist.iterator + cutlass.Int32(bne), cutlass.Int32(1)
                                     )
-                        cute.arch.barrier()  # esc level hist
+                        self._sync()  # esc level hist
                         if cutlass.const_expr(self.nbh > 1024):
-                            scan_cross_w(s_hist, s_ws, needC, tid, s_res, blk=self.blk, nb=self.nbh)
+                            scan_cross_w(
+                                s_hist,
+                                s_ws,
+                                needC,
+                                tid,
+                                s_res,
+                                blk=self.blk,
+                                nb=self.nbh,
+                                bar=self.bar_id,
+                            )
                         else:
                             find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
-                        cute.arch.barrier()  # esc level scan
+                        self._sync()  # esc level scan
                         needC = needC - s_res[RES_ABOVE]
                         mm = s_res[RES_M]
                         b_lv = s_res[RES_B]
@@ -4809,7 +4848,7 @@ class GvrTopkRegKernel:
                 ethr = cutlass.Int64(rlo)
                 if state == cutlass.Int32(2):
                     ethr = ethr - cutlass.Int64(1)
-                cute.arch.barrier()  # descent done
+                self._sync()  # descent done
                 # output offset of this emit region: window-local (-lead) or absolute
                 # (+col0 = ks & -4: in the absolute variant `ks` is the ONE per-row value
                 # kept live through the ladder; lead = ks & 3 and col0 are recomputed at
@@ -5063,7 +5102,7 @@ class GvrTopkRegKernel:
 
                 # ---- refine (skipped when whole — CUDA returned inside emit)
                 if whole == cutlass.Int32(0):
-                    cute.arch.barrier()  # emit done
+                    self._sync()  # emit done
                     if cutlass.const_expr(self.cur):
                         mc = m
                         if mc > cmp_:
@@ -5104,14 +5143,14 @@ class GvrTopkRegKernel:
                         if tid == cutlass.Int32(0):
                             s_kmm[0] = cutlass.Uint32(0xFFFFFFFF)
                             s_kmm[1] = cutlass.Uint32(0)
-                        cute.arch.barrier()  # kmm init
+                        self._sync()  # kmm init
                         i = tid
                         while i < mc:
                             kv = cutlass.Uint32(ck[i])
                             atomic_min_cta(s_kmm.iterator, kv)
                             atomic_max_cta(s_kmm.iterator + 1, kv)
                             i = i + cutlass.Int32(BLK)
-                        cute.arch.barrier()  # key range published
+                        self._sync()  # key range published
                         rlo = cutlass.Uint32(s_kmm[0])
                         rhi = cutlass.Uint32(s_kmm[1])
                         ethr = cutlass.Int64(rlo)
@@ -5143,7 +5182,7 @@ class GvrTopkRegKernel:
                                     sh2 = b2w - cutlass.Int32(LNBH)
                                 for z in cutlass.range_constexpr(self.nbh // self.blk):
                                     s_hist[tid + cutlass.Int32(z * self.blk)] = cutlass.Int32(0)
-                                cute.arch.barrier()  # level clear
+                                self._sync()  # level clear
                                 i = tid
                                 while i < mc:
                                     unar = cutlass.Uint32(ck[i])
@@ -5156,14 +5195,21 @@ class GvrTopkRegKernel:
                                                 cutlass.Int32(1),
                                             )
                                     i = i + cutlass.Int32(BLK)
-                                cute.arch.barrier()  # level hist
+                                self._sync()  # level hist
                                 if cutlass.const_expr(self.nbh > 1024):
                                     scan_cross_w(
-                                        s_hist, s_ws, needC, tid, s_res, blk=self.blk, nb=self.nbh
+                                        s_hist,
+                                        s_ws,
+                                        needC,
+                                        tid,
+                                        s_res,
+                                        blk=self.blk,
+                                        nb=self.nbh,
+                                        bar=self.bar_id,
                                     )
                                 else:
                                     find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
-                                cute.arch.barrier()  # level scan
+                                self._sync()  # level scan
                                 aboveC = aboveC + s_res[RES_ABOVE]
                                 needC = needC - s_res[RES_ABOVE]
                                 mm = s_res[RES_M]
@@ -5180,7 +5226,7 @@ class GvrTopkRegKernel:
                         if tid == cutlass.Int32(0):
                             s_e12[0] = cutlass.Int32(0)
                             s_e12[1] = cutlass.Int32(0)
-                        cute.arch.barrier()  # emit counters
+                        self._sync()  # emit counters
                         lml = cutlass.Int32(cute.arch.lanemask_lt())
                         it2 = (mc + cutlass.Int32(self.blk - 1)) // cutlass.Int32(self.blk)
                         it = cutlass.Int32(0)
@@ -5226,7 +5272,7 @@ class GvrTopkRegKernel:
                             it = it + cutlass.Int32(1)
             # ---- coalesced output write (all emit paths converge here) ----
             if cutlass.const_expr(self.stage_out):
-                cute.arch.barrier()  # staged outputs complete
+                self._sync()  # staged outputs complete
                 io = tid
                 while io < k:
                     vo = cutlass.Int32(s_out[io])
