@@ -667,15 +667,21 @@ def test_gvr2_warmup_then_capture():
 # ---------------------------------------------------------------------------
 
 # (rows, msl_c, top_k, next_n, cr). The decode launch is planned for msl_c (the
-# CUDA-graph capacity) and lands on a SPLIT main engine (1024 threads, R CTAs
-# per row: R = 33 / 16 / 9 / 4 here), while the rows are much shorter. Register
-# rows are <= 16384 columns; rows up to half that take the VPT 2 body.
+# CUDA-graph capacity) and lands on a main engine, while the rows are much
+# shorter: SPLIT (1024 threads, R CTAs per row: R = 33 / 16 / 9 / 4 here) or one
+# CTA per row (1024 threads at 128 and 64 rows, 512 threads at 160 rows).
+# Register rows are <= 16384 columns at 1024 threads and <= 8192 at 512; rows
+# up to half that take the VPT 2 body.
 _MAIN_REG_SHAPES = [
     (1, 131136, 512, 1, 1),
     (9, 131136, 512, 1, 1),
     (9, 131136, 2048, 1, 1),
     (16, 131136, 1024, 2, 4),
     (32, 131136, 2048, 1, 1),  # K = 2048 keeps SPLIT up to 32 rows
+    (128, 131136, 512, 1, 1),
+    (64, 131136, 2048, 1, 1),  # K = 2048: one CTA per row from 33 rows
+    (160, 65600, 1024, 2, 4),
+    (160, 65600, 2048, 1, 1),
 ]
 
 
@@ -684,16 +690,21 @@ def _main_reg_cap(rows, msl_c, top_k):
     for this envelope, from the plan the launcher uses."""
     plan = _host.route_streaming(rows, max(msl_c, top_k + 1), msl_c, top_k, force_main=True)
     blk = plan["tpl"][0]
-    return blk * _host._main_reg_vpt(blk, plan["tpl"][5]) * 4
+    return blk * _host._main_reg_vpt(blk, plan["tpl"][5], msl_c) * 4
 
 
-def test_gvr2_main_register_path_split_engines_only():
-    """The register path is compiled into the SPLIT main engines only."""
-    assert _host._main_reg_vpt(1024, True) == 4
-    assert _host._main_reg_vpt(1024, False) == 0
-    assert _host._main_reg_vpt(512, False) == 0
-    assert _host._main_reg_vpt(256, False) == 0
-    assert _main_reg_cap(160, 65600, 512) == 0  # one CTA per row: streams
+def test_gvr2_main_register_path_policy():
+    """The SPLIT main engines always compile the register path in; the
+    one-CTA-per-row engines (1024 and 512 threads) only for an envelope of at
+    least _MAIN_REG_ENV times their register rows; 256 threads never."""
+    env = _host._MAIN_REG_ENV
+    assert _host._main_reg_vpt(1024, True, 0) == 4
+    for blk in (1024, 512):
+        assert _host._main_reg_vpt(blk, False, env * blk * 16) == 4
+        assert _host._main_reg_vpt(blk, False, env * blk * 16 - 1) == 0
+    assert _host._main_reg_vpt(256, False, 1 << 20) == 0
+    assert _main_reg_cap(160, 65600, 512) == 8192
+    assert _main_reg_cap(160, 65472, 512) == 0  # below the envelope gate: streams
 
 
 def _band_lengths(n, top_k, cap, msl_c, gen):
@@ -722,8 +733,8 @@ def _band_lengths(n, top_k, cap, msl_c, gen):
 @requires_gvr2
 @pytest.mark.parametrize("rows,msl_c,top_k,next_n,cr", _MAIN_REG_SHAPES)
 def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
-    """Rows far shorter than the launch envelope on the SPLIT main engines,
-    hinted and hint-free: rows that fit the CTA's registers (short and empty rows
+    """Rows far shorter than the launch envelope on the main engines, hinted
+    and hint-free: rows that fit the CTA's registers (short and empty rows
     included) take the in-kernel register path, the others stream. Every row is
     exact, including the band edges (cap, cap + 1) and k + 1."""
     cap = _main_reg_cap(rows, msl_c, top_k)
@@ -749,13 +760,17 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
 
 
 @requires_gvr2
-@pytest.mark.parametrize("rows,msl_c", [(9, 131136), (16, 131136)], ids=["split9", "split16"])
+@pytest.mark.parametrize(
+    "rows,msl_c",
+    [(9, 131136), (16, 131136), (128, 131136), (160, 65600)],
+    ids=["split9", "split16", "cta1024", "cta512"],
+)
 @pytest.mark.parametrize(
     "pattern", ["constant", "quantized4", "huge_flood_gt_k", "posinf", "neginf_tail"]
 )
 def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern):
     """Tie floods, +inf and an in-window -inf tail inside register-path rows of a
-    SPLIT main launch (the register body's escape and degenerate-bracket arms),
+    main launch (the register body's escape and degenerate-bracket arms),
     hinted and hint-free. Rows of cap - 3 columns put the last column outside
     the float4 batch (n % 4 == 1)."""
     top_k = 1024
@@ -786,7 +801,9 @@ def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern):
 
 @requires_gvr2
 @pytest.mark.parametrize(
-    "rows,msl_c,top_k", [(9, 131136, 512), (32, 131136, 2048)], ids=["split9", "split32"]
+    "rows,msl_c,top_k",
+    [(9, 131136, 512), (32, 131136, 2048), (128, 131136, 512), (160, 65600, 2048)],
+    ids=["split9", "split32", "cta1024", "cta512"],
 )
 @pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
 def test_gvr2_main_register_path_graph_replay(rows, msl_c, top_k, paged):
