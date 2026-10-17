@@ -1233,10 +1233,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     )
     amin = 3 * k if r_const == 2 else (7 * k) // 2
     sd_en = _small_row_sample(k, big, r_const, aim_base, hint_free)
-    # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
-    # num_rows > 15 would strand small batches in SPLIT-main without the
-    # staged floor (a distribution-dependent tail regression); the kernel
-    # gates TSH per row at runtime anyway.
+    # TSH-floor gate: SPLIT and K only (the CUDA form also needs num_rows >
+    # 15). The varlen kernel gives the rows it admits (n4 <= 32768) a 4x
+    # denser sample in place of the floor; see GvrMainKernel's ladder.
     tsh_en = 1 if (tpl[5] and k <= 1024) else 0
     # slot 0 (`n`) carries the envelope: the varlen prologue clamps each row's
     # kv-derived length to it, never to the row stride npad (arena tails)
