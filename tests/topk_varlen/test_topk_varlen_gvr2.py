@@ -2596,36 +2596,40 @@ def test_gvr2_route_unsplit_slab_regime():
 
 
 def test_gvr2_small_row_sample_gate():
-    """sd_en, the small-row pair sample of the streaming slab: upstream's K > 1024
-    off the big regime, plus (FlashInfer-local) hint-free launches with one CTA
-    per row whose sample keeps at most 2k survivors (see _small_row_sample)."""
+    """sd_en, the small-row pair sample of the streaming slab (rows of
+    max(2k, sd_en) < n <= SCAP; 0 = off): upstream's K > 1024 off the big regime,
+    and (FlashInfer-local) for hint-free launches the row length past which the
+    sample stages fewer survivors than the row holds (see _small_row_sample)."""
     g = _host._small_row_sample
-    # upstream rule, hinted or not: K > 1024 off the big regime
-    for hint_free in (False, True):
-        assert g(2048, False, 1, 2816, hint_free) == 1
-    assert g(512, False, 1, 768, False) == 0 and g(512, True, 1, 1024, False) == 0
-    # hint-free, one CTA per row, aim <= 2k: the one-wave slab at K = 512
-    # (aim 2k) and the 256/512-thread slabs (aim 1.5k / 1.375k)
-    assert g(512, True, 1, 1024, True) == 1
-    assert g(512, False, 1, 768, True) == 1
-    assert g(1024, False, 1, 1408, True) == 1
-    # ... but not the one-wave slab at K >= 1024 (aim 4k) nor any SPLIT slab
-    assert g(1024, True, 1, 4096, True) == 0
-    assert g(2048, True, 1, 8192, True) == 0
-    assert g(512, True, 37, 1024, True) == 0
-    assert g(2048, True, 4, 4096, True) == 0
+    # hinted: upstream, every row above 2k for K > 1024 off the big regime
+    assert g(2048, False, 1, 2816, False) == 1
+    assert g(512, False, 1, 768, False) == 0 and g(2048, True, 1, 8192, False) == 0
+    # hint-free, one CTA per row: rows longer than aim (the kernel floors sd_en
+    # at 2k): the one-wave slab (aim 2k at K = 512, 4k above) and the 256/512-
+    # thread slabs (aim below 2k)
+    assert g(512, True, 1, 1024, True) == 1024
+    assert g(1024, True, 1, 4096, True) == 4096
+    assert g(2048, True, 1, 8192, True) == 8192
+    assert g(512, False, 1, 768, True) == 768
+    # hint-free SPLIT: 1.25x the staged count, 2 * aim under the TSH floor
+    # (K <= 1024); at K = 1024 that lands above SCAP (8192), so no row below
+    # SCAP is sampled
+    assert g(512, True, 37, 1792, True) == 4480
+    assert g(1024, True, 9, 3584, True) == 8960
+    assert g(2048, True, 4, 4096, True) == 5120
 
 
 @requires_gvr2
 @pytest.mark.parametrize(
     "rows,ncols,top_k,want_hint_free,want_hinted",
     [
-        (128, 131072, 512, 1, 0),  # one-wave slab, K=512 (aim 2k)
-        (128, 131072, 1024, 0, 0),  # one-wave slab, K=1024 (aim 4k)
-        (160, 131072, 512, 1, 0),  # two-CTA slab
-        (160, 131072, 2048, 1, 1),  # two-CTA slab, K > 1024 (upstream)
-        (4, 262144, 512, 0, 0),  # SPLIT slab
-        (4, 262144, 2048, 0, 0),  # SPLIT slab, K > 1024 but big
+        (128, 131072, 512, 1024, 0),  # one-wave slab, K=512 (aim 2k)
+        (128, 131072, 1024, 4096, 0),  # one-wave slab, K=1024 (aim 4k)
+        (64, 131072, 2048, 8192, 0),  # one-wave slab, K=2048 (aim 4k)
+        (160, 131072, 512, 768, 0),  # two-CTA slab (aim 1.5k: floored at 2k)
+        (160, 131072, 2048, 2816, 1),  # two-CTA slab, K > 1024 (upstream)
+        (4, 262144, 512, 4480, 0),  # SPLIT slab: 1.25 x 2 x aim (1792)
+        (4, 262144, 2048, 5120, 0),  # SPLIT slab, K > 1024: 1.25 x aim (4096)
     ],
 )
 def test_gvr2_launcher_small_row_sample(
@@ -2643,6 +2647,32 @@ def test_gvr2_launcher_small_row_sample(
         )
         assert lc[0] == "main", lc[0]
         assert lc[3][3] == want, (hint_free, page_shift, lc[3])
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,cap_c,top_k",
+    [
+        (128, 131072, 1024),  # one-wave slab: threshold aim = 4096
+        (64, 131072, 2048),  # one-wave slab, K=2048: threshold aim = 8192
+        (4, 262144, 512),  # SPLIT slab, R=37: threshold 4480
+        (8, 1048576, 2048),  # SPLIT slab, R=18, K=2048: threshold 5120
+    ],
+)
+def test_gvr2_small_row_sample_threshold_edges(rows, cap_c, top_k):
+    """Hint-free rows on both sides of the launch's small-row sample threshold
+    (sampled above it, unsampled at or below it) rank exactly, mixed with rows
+    on the 2k floor and the SCAP edge, at a capacity far above every row."""
+    lc = _host._varlen_launcher(rows, cap_c, top_k, cap_c, 1, 1, True, None)
+    thr = lc[3][3]
+    assert 2 * top_k < thr < 16384, lc[3]
+    edges = [thr, thr + 1, thr - 1, thr + 4, 2 * top_k + 1, 8192, 8196]
+    cols = [edges[r % len(edges)] for r in range(rows)]
+    logits, seq_lens, _, n_r, _ = _make_varlen_case(
+        cols, 1, 1, top_k, seed=rows + top_k, msl_c=cap_c
+    )
+    indices, _ = _run_gvr2(logits, seq_lens, top_k, None)
+    _check_varlen_rows(logits, indices, n_r, top_k)
 
 
 def test_gvr2_route_reg_clus_sm_count_aware():

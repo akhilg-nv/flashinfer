@@ -193,24 +193,29 @@ def _big_regime(b: int, R: int, n4: int) -> bool:
     return b * R <= 148 and not (R == 1 and b >= 75 and n4 <= 16384)
 
 
-def _small_row_sample(k: int, big: bool, R: int, aim_base: int, hint_free: bool) -> int:
-    """The streaming slab's ``sd_en`` (varlen launcher): rows of 2k < n <= SCAP
-    take the pair sample too; rows above SCAP always do.
+def _small_row_sample(k: int, big: bool, R: int, aim: int, hint_free: bool) -> int:
+    """The streaming slab's ``sd_en`` (varlen launcher): 0, or a row length; rows
+    of max(2k, sd_en) < n <= SCAP then take the pair sample too (rows above SCAP
+    always do).
 
-    Upstream: K > 1024 off the big regime. FlashInfer-local: hint-free launches
-    with one CTA per row (R == 1) also take it wherever the sample keeps at most
-    2k survivors (aim_base <= 2k). Unsampled, a hinted row thresholds at the
-    minimum of the previous step's top-k and keeps about k survivors, but a
-    hint-free row thresholds at the minimum of its own first k values and keeps
-    nearly all n of them. A launch sized for a capacity far above its rows (a
-    CUDA graph at the serving width) runs every row up to SCAP that way: 128
-    rows of 16K columns at 1M capacity, K=512, 17.7 us unsampled vs 6.2 us
-    sampled (B200). The sample pays only where it keeps fewer survivors than
-    the rows the gate admits, which excludes the one-wave slab at K >= 1024
-    (aim 4k: rows of 2k-4k columns up to 8% slower) and the SPLIT slab, whose
-    every part repeats the sample (K = 2048: 3-5% slower at 4.1K-4.6K columns
-    even with aim capped at 2k)."""
-    return int((k > 1024 and not big) or (hint_free and R == 1 and aim_base <= 2 * k))
+    Upstream: 1 for K > 1024 off the big regime. FlashInfer-local, hint-free
+    launches: unsampled, a hinted row thresholds at the minimum of the previous
+    step's top-k and keeps about k survivors, but a hint-free row thresholds at
+    the minimum of its own first k values and keeps nearly all n of them. A
+    launch sized for a capacity far above its rows (a CUDA graph at the serving
+    width) runs every row up to SCAP that way: 128 rows of 16K columns at 1M
+    capacity, K=512, 17.7 us unsampled vs 6.2 us sampled (B200). The sample
+    stages about ``aim`` survivors instead (2 * aim on the SPLIT slab at K <= 1024
+    once its TSH floor engages), so it pays once n clears that count: right away
+    with one CTA per row (at n <= aim it runs 3-7% slower), from 1.25x on the
+    SPLIT slab, whose every part repeats the sample (just above the staged count
+    it runs up to 6% slower)."""
+    if not hint_free:
+        return int(k > 1024 and not big)
+    if R == 1:
+        return aim
+    staged = 2 * aim if k <= 1024 else aim
+    return staged + staged // 4
 
 
 def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
@@ -1112,7 +1117,10 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         else (64 if k >= 1024 else 32)
     )
     amin = 3 * k if r_const == 2 else (7 * k) // 2
-    sd_en = _small_row_sample(k, big, r_const, aim_base, hint_free)
+    # the kernel's per-row sample target for rows up to SCAP (its sqrt(6n) term
+    # stays below aim_base there)
+    aim = aim_base if r_const == 1 else min(max(aim_base, amin), rt["SCAP_"] // 2)
+    sd_en = _small_row_sample(k, big, r_const, aim, hint_free)
     # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
     # num_rows > 15 would strand small batches in SPLIT-main without the
     # staged floor (a distribution-dependent tail regression); the kernel
