@@ -690,7 +690,7 @@ def _split_row_lens(msl_c, top_k):
     """Compressed row lengths around every per-row decision of the split slab:
     short (n <= k), the unsampled band (n <= 8192), both sides of the one-part
     bound (8192 columns at U <= 2, one tile = 16384 / 32768 columns at U = 4 /
-    8), and the envelope itself."""
+    8), half-tile parts (U = 1, R >= 128), and the envelope itself."""
     lens = [
         top_k // 2,
         top_k,
@@ -724,10 +724,13 @@ def _split_row_lens(msl_c, top_k):
     ],
 )
 def test_gvr2_split_rows_far_below_envelope(rows, msl_c, top_k, next_n, cr):
-    """SPLIT launches are sized by the capture-time envelope, but a row of at
-    most one tile (or 8192 columns) runs on one part without the slab; longer
-    rows use all R parts. Rows of every length up to the envelope (no row
-    pinned at the envelope), hinted and hint-free, must stay exact."""
+    """SPLIT launches are sized by the capture-time envelope, but the number of
+    parts that take a row follows its live length: a row of at most one tile
+    (or 8192 columns) runs on one part without the slab, U == 1 engines with
+    R >= 128 split a longer row into half-tile parts, and only rows that need
+    them use all R.
+    Rows of every length up to the envelope (no row pinned at the envelope),
+    hinted and hint-free, must stay exact."""
     batch = rows // next_n
     pool = _split_row_lens(msl_c, top_k)
     for hint_free in (False, True):

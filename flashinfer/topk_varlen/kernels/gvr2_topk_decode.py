@@ -1538,9 +1538,11 @@ class GvrMainKernel:
         self.pf = self.pfd > 0
         self.natt = 1 if split else 3
         # SPLIT live part count (varlen): a row of at most SOLO float4s (one
-        # tile, or the SCPB columns a CTA stages in smem) runs on part 0 alone
-        # (see the varlen prologue)
+        # tile, or the SCPB columns a CTA stages in smem) runs on part 0 alone;
+        # engines with one float4 per thread per tile and R >= 128 parts split
+        # longer rows into parts of half a tile (see the varlen prologue)
         self.solo_f4 = max(blk * u, self.scpb >> 2)
+        self.part_f4 = blk // 2 if (u == 1 and self.r_const >= 128) else 0
         # smem blob byte map: cbuf/cbuf2 alias @0,
         # ck64 @ 4*(VSTG ? 2*(SCPB+4) : SCPB+4), size (CMPB+1)*8
         self.ck_off = 4 * ((2 * (self.scpb + 4)) if self.vstg else (self.scpb + 4))
@@ -1791,9 +1793,23 @@ class GvrMainKernel:
                     # a sliver far below one tile, and every part still pays the
                     # sample, the scans and the slab protocol. A row of at most
                     # SOLO float4s runs on part 0 alone, which ranks it in place
-                    # (no slab; P3 hand-off). A pure function of the row, so
-                    # every part computes the same r_eff; the election counts it.
+                    # (no slab; P3 hand-off). On U == 1 engines with R >= 128
+                    # (one float4 per thread per tile: a single row on a
+                    # 0.5M-1M-column envelope) a longer row takes parts of half a
+                    # tile while that needs fewer than R parts. Measured on B200
+                    # against the R-way split: full-tile parts, a split below R
+                    # on U > 1 engines, and the half-tile split at R = 37 / 65
+                    # were slower on real decode rows. A pure function of the
+                    # row, so every part computes the same r_eff; the election
+                    # counts r_eff.
                     r_eff = cutlass.Int32(self.r_const)
+                    if cutlass.const_expr(self.part_f4 > 0):
+                        rh = (n4v + cutlass.Int32(self.part_f4 - 1)) >> cutlass.Int32(
+                            self.part_f4.bit_length() - 1
+                        )
+                        if rh < cutlass.Int32(self.r_const):
+                            r_eff = rh
+                            Q = cutlass.Int32(self.part_f4)
                     if n4v <= cutlass.Int32(self.solo_f4):
                         r_eff = cutlass.Int32(1)
                         Q = n4v
