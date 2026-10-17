@@ -1985,6 +1985,56 @@ def test_gvr2_route_unsplit_slab_regime():
     assert _host._big_regime(149, 1, 8192) is False  # b > 148: never big
 
 
+def test_gvr2_small_row_sample_gate():
+    """sd_en, the small-row pair sample of the streaming slab: upstream's K > 1024
+    off the big regime, plus (FlashInfer-local) hint-free launches with one CTA
+    per row whose sample keeps at most 2k survivors (see _small_row_sample)."""
+    g = _host._small_row_sample
+    # upstream rule, hinted or not: K > 1024 off the big regime
+    for hint_free in (False, True):
+        assert g(2048, False, 1, 2816, hint_free) == 1
+    assert g(512, False, 1, 768, False) == 0 and g(512, True, 1, 1024, False) == 0
+    # hint-free, one CTA per row, aim <= 2k: the one-wave slab at K = 512
+    # (aim 2k) and the 256/512-thread slabs (aim 1.5k / 1.375k)
+    assert g(512, True, 1, 1024, True) == 1
+    assert g(512, False, 1, 768, True) == 1
+    assert g(1024, False, 1, 1408, True) == 1
+    # ... but not the one-wave slab at K >= 1024 (aim 4k) nor any SPLIT slab
+    assert g(1024, True, 1, 4096, True) == 0
+    assert g(2048, True, 1, 8192, True) == 0
+    assert g(512, True, 37, 1024, True) == 0
+    assert g(2048, True, 4, 4096, True) == 0
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,ncols,top_k,want_hint_free,want_hinted",
+    [
+        (128, 131072, 512, 1, 0),  # one-wave slab, K=512 (aim 2k)
+        (128, 131072, 1024, 0, 0),  # one-wave slab, K=1024 (aim 4k)
+        (160, 131072, 512, 1, 0),  # two-CTA slab
+        (160, 131072, 2048, 1, 1),  # two-CTA slab, K > 1024 (upstream)
+        (4, 262144, 512, 0, 0),  # SPLIT slab
+        (4, 262144, 2048, 0, 0),  # SPLIT slab, K > 1024 but big
+    ],
+)
+def test_gvr2_launcher_small_row_sample(
+    rows, ncols, top_k, want_hint_free, want_hinted
+):
+    """The varlen launcher passes _small_row_sample's sd_en in its tail scalars
+    (aim_base, sfac, amin, sd_en, tsh_en), paged engines like hint-free ones."""
+    for hint_free, page_shift, want in (
+        (True, None, want_hint_free),
+        (True, 6, want_hint_free),
+        (False, None, want_hinted),
+    ):
+        lc = _host._varlen_launcher(
+            rows, ncols, top_k, ncols, 1, 1, hint_free, page_shift
+        )
+        assert lc[0] == "main", lc[0]
+        assert lc[3][3] == want, (hint_free, page_shift, lc[3])
+
+
 def test_gvr2_route_reg_clus_sm_count_aware():
     """The clustered-register admission (`av`) follows the SM count on parts with
     >= 148 SMs (Rubin/B300: bigger clusters, reg_clus where B200 falls to the
