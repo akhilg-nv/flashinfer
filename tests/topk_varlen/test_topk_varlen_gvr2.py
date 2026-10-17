@@ -601,8 +601,8 @@ def test_gvr2_family_parity_and_oracle(rows, msl_c, top_k, next_n, cr, family):
 # single warp loads, the solo bound of one BLK * U chunk at U = 4 (16384) and at
 # U = 8 (32768) with one float4 past each, ragged n % 4 tails, and rows of
 # several chunks.
-_CLUS_LIVE_COLS = [256, 512, 513, 1031, 4099, 16383, 16384, 16385, 32767, 32768,
-                   32769, 32772, 40000, 65541]
+_CLUS_LIVE_COLS = [256, 512, 513, 1031, 4099]
+_CLUS_LIVE_COLS += [16383, 16384, 16385, 32767, 32768, 32769, 32772, 40000, 65541]
 
 
 @requires_gvr2
