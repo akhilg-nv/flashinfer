@@ -205,17 +205,13 @@ def _small_row_sample(k: int, big: bool, R: int, aim: int, hint_free: bool) -> i
     launch sized for a capacity far above its rows (a CUDA graph at the serving
     width) runs every row up to SCAP that way: 128 rows of 16K columns at 1M
     capacity, K=512, 17.7 us unsampled vs 6.2 us sampled (B200). The sample
-    stages about ``aim`` survivors instead (2 * aim on the SPLIT slab at K <= 1024
-    once its TSH floor engages), so it pays once n clears that count: right away
-    with one CTA per row (at n <= aim it runs 3-7% slower), from 1.25x on the
-    SPLIT slab, whose every part repeats the sample (just above the staged count
-    it runs up to 6% slower)."""
+    stages about ``aim`` survivors instead, so it pays once n clears that count
+    (at n <= aim it runs 3-7% slower). The SPLIT slab (R > 1) gets 0: it ranks
+    every row of up to 16384 columns, above its SCAP, with the in-kernel register
+    path (``_main_reg_vpt``), so no row the gate admits reaches it."""
     if not hint_free:
         return int(k > 1024 and not big)
-    if R == 1:
-        return aim
-    staged = 2 * aim if k <= 1024 else aim
-    return staged + staged // 4
+    return aim if R == 1 else 0
 
 
 def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object]:
@@ -1134,10 +1130,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         else (64 if k >= 1024 else 32)
     )
     amin = 3 * k if r_const == 2 else (7 * k) // 2
-    # the kernel's per-row sample target for rows up to SCAP (its sqrt(6n) term
-    # stays below aim_base there)
-    aim = aim_base if r_const == 1 else min(max(aim_base, amin), rt["SCAP_"] // 2)
-    sd_en = _small_row_sample(k, big, r_const, aim, hint_free)
+    sd_en = _small_row_sample(k, big, r_const, aim_base, hint_free)
     # TSH-floor staging: gate on SPLIT and K only. Gating additionally on
     # num_rows > 15 would strand small batches in SPLIT-main without the
     # staged floor (a distribution-dependent tail regression); the kernel

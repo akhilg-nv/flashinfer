@@ -2815,12 +2815,10 @@ def test_gvr2_small_row_sample_gate():
     assert g(1024, True, 1, 4096, True) == 4096
     assert g(2048, True, 1, 8192, True) == 8192
     assert g(512, False, 1, 768, True) == 768
-    # hint-free SPLIT: 1.25x the staged count, 2 * aim under the TSH floor
-    # (K <= 1024); at K = 1024 that lands above SCAP (8192), so no row below
-    # SCAP is sampled
-    assert g(512, True, 37, 1792, True) == 4480
-    assert g(1024, True, 9, 3584, True) == 8960
-    assert g(2048, True, 4, 4096, True) == 5120
+    # hint-free SPLIT: off; its rows up to 16384 columns, above SCAP (8192),
+    # take the in-kernel register path
+    assert g(512, True, 37, 1024, True) == 0
+    assert g(2048, True, 4, 4096, True) == 0
 
 
 @requires_gvr2
@@ -2832,8 +2830,8 @@ def test_gvr2_small_row_sample_gate():
         (64, 131072, 2048, 8192, 0),  # one-wave slab, K=2048 (aim 4k)
         (160, 131072, 512, 768, 0),  # two-CTA slab (aim 1.5k: floored at 2k)
         (160, 131072, 2048, 2816, 1),  # two-CTA slab, K > 1024 (upstream)
-        (4, 262144, 512, 4480, 0),  # SPLIT slab: 1.25 x 2 x aim (1792)
-        (4, 262144, 2048, 5120, 0),  # SPLIT slab, K > 1024: 1.25 x aim (4096)
+        (4, 262144, 512, 0, 0),  # SPLIT slab: off (register path)
+        (4, 262144, 2048, 0, 0),  # SPLIT slab, K > 1024: off (register path)
     ],
 )
 def test_gvr2_launcher_small_row_sample(
@@ -2859,8 +2857,6 @@ def test_gvr2_launcher_small_row_sample(
     [
         (128, 131072, 1024),  # one-wave slab: threshold aim = 4096
         (64, 131072, 2048),  # one-wave slab, K=2048: threshold aim = 8192
-        (4, 262144, 512),  # SPLIT slab, R=37: threshold 4480
-        (8, 1048576, 2048),  # SPLIT slab, R=18, K=2048: threshold 5120
     ],
 )
 def test_gvr2_small_row_sample_threshold_edges(rows, cap_c, top_k):
