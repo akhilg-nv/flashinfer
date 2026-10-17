@@ -1471,6 +1471,12 @@ def _pt_xf(pre_idx, req, v, ps: int):
     )
 
 
+def _row_kv(kv_lens, req, kv_pre):
+    """Request ``req``'s kv_lens entry: ``kv_pre`` when the launch read it before
+    griddepcontrol.wait (``early_len`` compiles), else a read here."""
+    return kv_lens[req] if kv_pre is None else kv_pre
+
+
 @cute.jit
 def _short_row_out(
     out,
@@ -1544,6 +1550,7 @@ class GvrMainKernel:
         pt_smem: int = 0,
         pdl: bool = False,
         reg_vpt: int = 0,
+        early_len: bool = False,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1558,6 +1565,12 @@ class GvrMainKernel:
         # instruction (before any global read), so the preceding kernel's
         # outputs are complete; only the launch processing overlaps its tail
         self.pdl = bool(pdl)
+        # early_len (decode, with PDL): each CTA reads its row's kv_lens entry
+        # before griddepcontrol.wait instead of after it, for callers whose
+        # kv_lens is never written by the kernel this launch overlaps (the
+        # host's kv_lens_before_pdl_wait). Every other read and every write
+        # stays after the wait.
+        self.early_len = bool(early_len) and self.pdl and bool(varlen) and not bool(prefill)
         # hint-free: gather_hint sites compiled out (sentinel pass-through);
         # upstream PR NVIDIA/TensorRT-LLM#18410
         self.hint_free = bool(hint_free)
@@ -1796,7 +1809,7 @@ class GvrMainKernel:
         return self._ox_g(pre_idx, v)
 
     @cute.jit
-    def _reg_arm(self, logits, pre_idx, kv_lens, out, n_row, k, row, part, sbase):
+    def _reg_arm(self, logits, pre_idx, kv_lens, out, n_row, k, row, part, sbase, kv_pre=None):
         """In-kernel register path (reg_vpt > 0, see the ctor). Only part 0 of a
         SPLIT row ranks it; the other parts never touch the slab, so the row
         owes no arrivals and its g_off / g_don stay zero."""
@@ -1811,23 +1824,29 @@ class GvrMainKernel:
             # (the 512-thread rung's code goes last: placed first, it made ptxas
             # spill in the other rungs and the streaming body of the unpaged engines)
             if nar == cutlass.Int32(0):
+                rank_args = (logits, pre_idx, kv_lens, out, n_row, k, row, sbase, kv_pre)
                 if cutlass.const_expr(len(self.regs) == 1):
-                    self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                    self._reg_rank(0, *rank_args)
                 else:
                     if n_row <= cutlass.Int32(self.regs[0][0]):
-                        self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                        self._reg_rank(0, *rank_args)
                     else:
-                        self._reg_rank(1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                        self._reg_rank(1, *rank_args)
             else:
                 if cutlass.const_expr(self.reg_nar is not None):
                     # the first 512 threads rank it; the others go straight to
                     # the exit, never reaching its named barrier
                     tid, _, _ = cute.arch.thread_idx()
                     if tid < cutlass.Int32(self.reg_nar[1].blk):
-                        self._reg_rank(-1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                        self._reg_rank(
+                            -1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase, kv_pre
+                        )
 
     @cute.jit
-    def _reg_rank(self, vi: cutlass.Constexpr, logits, pre_idx, kv_lens, out, n_row, k, row, sbase):
+    def _reg_rank(
+        self, vi: cutlass.Constexpr, logits, pre_idx, kv_lens, out, n_row, k, row, sbase,
+        kv_pre=None,
+    ):
         # vi: index into regs, -1 = the 512-thread rung
         _, body, win, cmp = self.reg_nar if vi < 0 else self.regs[vi]
         smem_bytes = cutlass.Int32(win)
@@ -1847,6 +1866,7 @@ class GvrMainKernel:
             smem_bytes,
             row,
             sbase,
+            kv_pre,
         )
 
     @cute.kernel
@@ -1884,6 +1904,10 @@ class GvrMainKernel:
         NATT = self.natt
         NW = BLK // 32
 
+        kv_pre = None  # this row's kv_lens entry, read before the wait (early_len)
+        if cutlass.const_expr(self.early_len):
+            _, row_p, _ = cute.arch.block_idx()
+            kv_pre = kv_lens[row_p // cutlass.Int32(self.next_n)]
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
 
@@ -1901,7 +1925,7 @@ class GvrMainKernel:
             if cutlass.const_expr(self.split):
                 if bx_s != cutlass.Int32(0):
                     own_s = cutlass.Int32(0)
-            kv_s = kv_lens[req_s]
+            kv_s = _row_kv(kv_lens, req_s, kv_pre)
             nv_s = (
                 kv_s
                 - cutlass.Int32(self.next_n)
@@ -1927,7 +1951,7 @@ class GvrMainKernel:
             # sees such a row. Row length as in the varlen prologue below.
             bx0, row0, _ = cute.arch.block_idx()
             rr0 = row0 % cutlass.Int32(self.next_n)
-            kv0 = kv_lens[row0 // cutlass.Int32(self.next_n)]
+            kv0 = _row_kv(kv_lens, row0 // cutlass.Int32(self.next_n), kv_pre)
             nv0 = (kv0 - cutlass.Int32(self.next_n) + rr0 + cutlass.Int32(1)) >> cutlass.Int32(
                 self.cr_shift
             )
@@ -1940,7 +1964,7 @@ class GvrMainKernel:
                 if cutlass.const_expr(self.split):
                     part0 = bx0
                 sbase0 = cute.arch.get_dyn_smem(cutlass.Int32, alignment=16).toint()
-                self._reg_arm(logits, pre_idx, kv_lens, out, nv0, k, row0, part0, sbase0)
+                self._reg_arm(logits, pre_idx, kv_lens, out, nv0, k, row0, part0, sbase0, kv_pre)
                 _exit_thread()
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -2003,7 +2027,7 @@ class GvrMainKernel:
             else:
                 req = row // cutlass.Int32(self.next_n)
                 rr = row % cutlass.Int32(self.next_n)
-                kvl = kv_lens[req]
+                kvl = _row_kv(kv_lens, req, kv_pre)
                 nv = (kvl - cutlass.Int32(self.next_n) + rr + cutlass.Int32(1)) >> cutlass.Int32(
                     self.cr_shift
                 )
@@ -3640,6 +3664,7 @@ def get_compiled(
     pt_smem: int = 0,
     pdl: bool = False,
     reg_vpt: int = 0,
+    early_len: bool = False,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3656,7 +3681,9 @@ def get_compiled(
     device).
 
     ``reg_vpt`` (decode tuple only) compiles in the per-row register path for
-    rows of at most BLK * reg_vpt * 4 columns (``GvrMainKernel``); 0 = off."""
+    rows of at most BLK * reg_vpt * 4 columns (``GvrMainKernel``); 0 = off.
+    ``early_len`` (decode with ``pdl``) reads each row's kv_lens entry before
+    griddepcontrol.wait (``GvrMainKernel``)."""
     prefill_abs = bool(prefill_abs) and bool(prefill)
     paged = bool(paged)
     if paged and not (hint_free and len(tpl) == 10 and not prefill):
@@ -3674,6 +3701,7 @@ def get_compiled(
         int(pt_smem) if paged else 0,
         bool(pdl),
         int(reg_vpt),
+        bool(early_len),
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3708,6 +3736,7 @@ def get_compiled(
             pt_smem=int(pt_smem) if paged else 0,
             pdl=bool(pdl),
             reg_vpt=int(reg_vpt),
+            early_len=bool(early_len),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3773,6 +3802,8 @@ def get_compiled(
         name += "_pdl1"
     if reg_vpt:
         name += f"_rg{int(reg_vpt)}"
+    if early_len:
+        name += "_el"
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled
@@ -4072,6 +4103,7 @@ class GvrTopkRegKernel:
         stage_out: bool = True,
         embedded: bool = False,
         bar_id: int = 0,
+        early_len: bool = False,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
@@ -4097,6 +4129,9 @@ class GvrTopkRegKernel:
         self.img = bool(img)
         self.nbh = nbh
         self.pdl = bool(pdl)
+        # read the row's kv_lens entry before griddepcontrol.wait (decode; see
+        # GvrMainKernel). Embedded bodies get that value from their host kernel.
+        self.early_len = bool(early_len) and self.pdl and bool(varlen) and not bool(prefill)
         # per-row varlen mode (production heuristicTopKDecode contract, same
         # semantics as GvrMainKernel/GvrRegClusKernel): n is re-derived PER
         # ROW in-kernel from a device kv_lens tensor; the scalar n launch arg
@@ -4207,11 +4242,14 @@ class GvrTopkRegKernel:
         self.row_topk(logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase)
 
     @cute.jit
-    def row_topk(self, logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase):
+    def row_topk(
+        self, logits, pre_idx, kv_lens, out, n, cmp_, qc, smem_bytes, row, sbase, kv_pre=None
+    ):
         """Register-resident top-K of row ``row``: the whole kernel body, with the
         smem window (map in the family docstring) at byte address ``sbase``.
         Separate from ``kern`` so the main and clus families can call it for
-        rows that fit their CTA's registers."""
+        rows that fit their CTA's registers (``kv_pre``: the row's kv_lens entry
+        when their launch read it before the PDL wait)."""
         BLK = cutlass.const_expr(self.blk)
         VPT = cutlass.const_expr(self.vpt)
         KPT = cutlass.const_expr(self.kpt)
@@ -4220,6 +4258,8 @@ class GvrTopkRegKernel:
         LNBH = cutlass.const_expr(self.lnbh)
         NW = cutlass.const_expr(self.blk // 32)
 
+        if cutlass.const_expr(self.early_len):
+            kv_pre = kv_lens[row // cutlass.Int32(self.next_n)]
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()  # knob default off
 
@@ -4299,7 +4339,7 @@ class GvrTopkRegKernel:
                 req = row // cutlass.Int32(self.next_n)
                 rr = row % cutlass.Int32(self.next_n)
                 prow = req
-                kvl = kv_lens[req]
+                kvl = _row_kv(kv_lens, req, kv_pre)
                 nv = (kvl - cutlass.Int32(self.next_n) + rr + cutlass.Int32(1)) >> cutlass.Int32(
                     self.cr_shift
                 )
@@ -5457,6 +5497,7 @@ def get_compiled__reg(
     page_shift=0,
     pt_smem=0,
     stage_out=True,
+    early_len=False,
 ):
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH).
@@ -5486,6 +5527,7 @@ def get_compiled__reg(
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
         bool(stage_out),
+        bool(early_len),
         C._compile_arch_token(),
     )
     compiled = _COMPILE_CACHE__reg.get(key)
@@ -5513,6 +5555,7 @@ def get_compiled__reg(
             page_shift=int(page_shift) if paged else 0,
             pt_smem=int(pt_smem) if paged else 0,
             stage_out=bool(stage_out),
+            early_len=bool(early_len),
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -5575,6 +5618,7 @@ def get_compiled__reg(
                 + (f"_pg{int(page_shift)}" if paged else "")
                 + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
                 + ("" if stage_out else "_ds")
+                + ("_el" if early_len else "")
             )
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__reg[key] = compiled
@@ -5715,6 +5759,7 @@ class GvrClusKernel:
         pdl: bool = False,
         solo: bool = False,
         reg_vpt: int = 0,
+        early_len: bool = False,
     ):
         assert blk == 1024, "gvr_clus is always BLK=1024"
         assert minb == 1, "gvr_clus is __launch_bounds__(BLK, 1)"
@@ -5724,6 +5769,8 @@ class GvrClusKernel:
         self.solo = bool(solo)
         # programmatic dependent launch (griddepcontrol.wait first, see GvrMainKernel)
         self.pdl = bool(pdl)
+        # read the row's kv_lens entry before that wait (see GvrMainKernel)
+        self.early_len = bool(early_len) and self.pdl and bool(varlen)
         # per-row varlen mode (production heuristicTopKDecode contract, same
         # semantics as GvrMainKernel / GvrRegClusKernel): n and the sampling-
         # ladder scalars are re-derived PER ROW in-kernel from a device
@@ -6011,6 +6058,10 @@ class GvrClusKernel:
         STEPC = self.stepc
         NW = BLK // 32
 
+        kv_pre = None  # this row's kv_lens entry, read before the wait (early_len)
+        if cutlass.const_expr(self.early_len):
+            _, row_p, _ = cute.arch.block_idx()
+            kv_pre = kv_lens[row_p // cutlass.Int32(self.next_n)]
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()
 
@@ -6039,7 +6090,7 @@ class GvrClusKernel:
             req = row // cutlass.Int32(self.next_n)
             rr = row % cutlass.Int32(self.next_n)
             prow = req
-            kvl = kv_lens[req]
+            kvl = _row_kv(kv_lens, req, kv_pre)
             nv = (kvl - cutlass.Int32(self.next_n) + rr + cutlass.Int32(1)) >> cutlass.Int32(
                 self.cr_shift
             )
@@ -7028,6 +7079,7 @@ class GvrClusKernel:
                             cutlass.Int32(self.reg_win) + k * cutlass.Int32(4),  # + k staged outputs
                             row,
                             sbase,
+                            kv_pre,
                         )
 
     # ------------------------------------------------------------------
@@ -7093,6 +7145,7 @@ def get_compiled__clus(
     pdl: bool = False,
     solo: bool = False,
     reg_vpt: int = 0,
+    early_len: bool = False,
 ):
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
@@ -7115,6 +7168,7 @@ def get_compiled__clus(
         bool(pdl),
         bool(solo),
         int(reg_vpt),
+        bool(early_len),
         C._compile_arch_token(),
     )
     if paged and not (varlen and hint_free):
@@ -7141,6 +7195,7 @@ def get_compiled__clus(
         pdl=bool(pdl),
         solo=bool(solo),
         reg_vpt=int(reg_vpt),
+        early_len=bool(early_len),
     )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -7181,6 +7236,7 @@ def get_compiled__clus(
         + ("_pdl1" if pdl else "")
         + ("_solo" if solo else "")
         + (f"_rg{int(reg_vpt)}" if reg_vpt else "")
+        + ("_el" if early_len else "")
     )
     if options_extra:
         name += "_opt_" + options_extra
@@ -7379,6 +7435,7 @@ class GvrRegClusKernel:
         page_shift: int = 0,
         pt_smem: int = 0,
         stage_out: bool = False,
+        early_len: bool = False,
     ):
         assert blk == BLKC, "all instantiations BLK=BLKC=1024"
         assert vpt in (1, 2, 4) and cs in (2, 4, 8)
@@ -7386,6 +7443,8 @@ class GvrRegClusKernel:
         self.vpt = vpt
         self.cs = cs
         self.pdl = bool(pdl)
+        # read the row's kv_lens entry before griddepcontrol.wait (see GvrMainKernel)
+        self.early_len = bool(early_len) and self.pdl and bool(varlen)
         # staged coalesced output: every rank writes its winners into rank 0's
         # k-word staging region (DSMEM stores, tail of the dynamic window after
         # the page-table row) and rank 0 writes the row in one coalesced pass
@@ -7471,6 +7530,10 @@ class GvrRegClusKernel:
         S = cutlass.const_expr(self.S)
         NW = cutlass.const_expr(self.blk // 32)
 
+        kv_pre = None  # this row's kv_lens entry, read before the wait (early_len)
+        if cutlass.const_expr(self.early_len):
+            _, row_p, _ = cute.arch.block_idx()
+            kv_pre = kv_lens[row_p // cutlass.Int32(self.next_n)]
         if cutlass.const_expr(self.pdl):
             cute.arch.griddepcontrol_wait()  # knob default off
 
@@ -7495,7 +7558,7 @@ class GvrRegClusKernel:
             req = row // cutlass.Int32(self.next_n)
             rr = row % cutlass.Int32(self.next_n)
             prow = req
-            kvl = kv_lens[req]
+            kvl = _row_kv(kv_lens, req, kv_pre)
             nv = (kvl - cutlass.Int32(self.next_n) + rr + cutlass.Int32(1)) >> cutlass.Int32(
                 self.cr_shift
             )
@@ -8199,6 +8262,7 @@ def get_compiled__regclus(
     page_shift=0,
     pt_smem=0,
     stage_out=False,
+    early_len=False,
 ):
     """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
     key = (
@@ -8212,6 +8276,7 @@ def get_compiled__regclus(
         int(page_shift) if paged else 0,
         int(pt_smem) if paged else 0,
         bool(stage_out),
+        bool(early_len),
         C._compile_arch_token(),
     )
     if paged and not (varlen and hint_free):
@@ -8234,6 +8299,7 @@ def get_compiled__regclus(
             page_shift=int(page_shift) if paged else 0,
             pt_smem=int(pt_smem) if paged else 0,
             stage_out=bool(stage_out),
+            early_len=bool(early_len),
         )
         nb_, nc_ = cute.sym_int(), cute.sym_int()
         nb2_, nc2_ = cute.sym_int(), cute.sym_int()
@@ -8279,6 +8345,7 @@ def get_compiled__regclus(
                 + (f"_pg{int(page_shift)}" if paged else "")
                 + (f"_pts{int(pt_smem)}" if (paged and pt_smem) else "")
                 + ("_ds" if stage_out else "")
+                + ("_el" if early_len else "")
             )
             compiled = C._persist(name, _compile_fn)
         _COMPILE_CACHE__regclus[key] = compiled

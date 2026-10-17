@@ -977,7 +977,9 @@ def _main_reg_vpt(blk: int, split: bool, n_env: int) -> int:
 _CLUS_REG_VPT = 2
 
 
-def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
+def _varlen_launcher(
+    num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None, early_len=False
+):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
@@ -989,7 +991,10 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     sample alone. Part of the cache key (distinct compiled objects).
     ``page_shift`` (log2 page size, hint-free only) selects the PAGED engines: the
     page table rides in the dead pre_idx slot and every emitted index leaves the
-    kernel as a physical KV slot (see ``_pt_xf`` in the device module)."""
+    kernel as a physical KV slot (see ``_pt_xf`` in the device module).
+    ``early_len`` selects engines that read each row's kv_lens entry before the
+    PDL wait (``run_varlen`` ``kv_lens_before_pdl_wait``); appended to the cache
+    key only when set, so the default key keeps its layout."""
     sms = _sm_count()
     hint_free = bool(hint_free)
     paged = page_shift is not None
@@ -1003,7 +1008,10 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         need_pages = (min(n_env, npad) + (1 << page_shift) - 1) >> page_shift
         if need_pages <= 1024:
             pt_smem = 1 << max(need_pages - 1, 0).bit_length()
+    early_len = bool(early_len)
     key = (num_rows, npad, k, n_env, next_n, cr, hint_free, page_shift, _arch_token(), sms)
+    if early_len:
+        key += ("early_len",)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1046,6 +1054,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 hint_free=hint_free,
                 pt_smem=0 if stage_rc else pt_smem,
                 stage_out=stage_rc,
+                early_len=early_len,
                 **pg,
             )
         )
@@ -1074,6 +1083,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 hint_free=hint_free,
                 pt_smem=pt_smem,
                 stage_out=stage_out,
+                early_len=early_len,
                 **pg,
             )
         )
@@ -1118,6 +1128,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 pdl=_DECODE_PDL,
                 solo=True,
                 reg_vpt=_CLUS_REG_VPT,
+                early_len=early_len,
                 **pg,
             )
         )
@@ -1142,6 +1153,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
             pt_smem=pt_smem,
             pdl=_DECODE_PDL,
             reg_vpt=_main_reg_vpt(tpl[0], tpl[5], n_kernel),
+            early_len=early_len,
             **pg,
         )
     )
@@ -2310,6 +2322,7 @@ def run_varlen(
     absolute_indices: bool = False,
     page_table: torch.Tensor | None = None,
     page_size: int = 1,
+    kv_lens_before_pdl_wait: bool = False,
 ) -> None:
     """Production-contract varlen entry (per-row device kv_lens).
 
@@ -2363,6 +2376,18 @@ def run_varlen(
     ``engine="reference"`` keeps the b=1 host-loop reference implementation —
     the differential oracle the in-kernel engine is validated against.
 
+    PDL: the decode engines launch with programmatic dependent launch and read
+    nothing before ``griddepcontrol.wait``, so their launch may overlap the tail
+    of the kernel before them on the stream. ``kv_lens_before_pdl_wait=True``
+    (decode only, default False) lets each CTA read its row's ``kv_lens`` entry
+    before that wait instead, which hides the read's latency when the launch
+    does overlap its predecessor; the logits, the page table and every output
+    stay after the wait. The caller guarantees that ``kv_lens`` is final when
+    the kernel launched immediately before this call (and anything that kernel
+    may still overlap) starts, i.e. no kernel this launch can overlap writes it,
+    and that it does not change until this call completes. These are distinct
+    compiled engines: warm them up with an eager call that passes the flag.
+
     KNOWN LIMITATION: on rows containing NaN logits the selected index SET
     can differ from ``heuristicTopKDecode.cu`` (both kernels order NaNs
     implementation-specifically). Finite inputs — including +/-inf and
@@ -2391,6 +2416,7 @@ def run_varlen(
                 absolute_indices=absolute_indices,
                 page_table=page_table,
                 page_size=page_size,
+                kv_lens_before_pdl_wait=kv_lens_before_pdl_wait,
             )
     if logits.dtype is not torch.float32:
         raise RuntimeError(
@@ -2651,7 +2677,10 @@ def run_varlen(
                 vals.copy_(lg.gather(1, idx64.clamp_min(0).clamp_max(npad - 1)))
                 vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
             return
+        early_len = bool(kv_lens_before_pdl_wait)
         key = (num_rows, npad, k, n_env, nn, cr, hint_free, page_shift, _arch_token(), _sm_count())
+        if early_len:
+            key += ("early_len",)  # as _varlen_launcher keys it
         lc = _VARLEN_CACHE.get(key)
         if lc is None:
             if _is_capturing():
@@ -2659,7 +2688,9 @@ def run_varlen(
                     "varlen launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, hint_free, page_shift)
+            lc = _varlen_launcher(
+                num_rows, npad, k, n_env, nn, cr, hint_free, page_shift, early_len
+            )
         idx = indices
         if idx.shape[1] != k:
             idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
