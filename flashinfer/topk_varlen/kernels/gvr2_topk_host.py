@@ -1087,6 +1087,12 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     # the sampling-ladder scalars (SMP/TGT/Q/SS2/TGT2) are dead launch slots,
     # re-derived per row in-kernel by the route_dynamic clus mirror.
     # Per-row n / short-row handling in-kernel.
+    # FlashInfer-local: solo rows (see the device family note). U comes from
+    # the envelope (U = 8 at every serving capacity), so a live row of <= one
+    # BLK * U chunk (32K columns) already ran on rank 0 alone; it now skips
+    # the cluster protocol as well. Measured B200, DSv4 Flash rows at 262,208
+    # columns, 32 / 64 rows: 12-19% faster on 1K-32K-column rows, longer rows
+    # within +-0.6%.
     if plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
         fn = _gate_first_call(
@@ -1100,6 +1106,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 hint_free=hint_free,
                 pt_smem=pt_smem,
                 pdl=_DECODE_PDL,
+                solo=True,
                 **pg,
             )
         )
