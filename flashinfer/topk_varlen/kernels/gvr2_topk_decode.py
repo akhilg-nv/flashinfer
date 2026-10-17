@@ -46,7 +46,8 @@ device), the main-family varlen prologue clamping each row's length to
 the envelope in launch slot ``n`` instead of the row stride, and the
 main family's in-kernel register path (``GvrMainKernel`` ``reg_vpt``, which
 calls ``GvrTopkRegKernel.row_topk``, the register kernel body split out of
-``kern``).  Keep future diffs against upstream mechanical.
+``kern``, also on part of the CTA with ``bar_id``).  Keep future diffs against
+upstream mechanical.
 """
 
 import contextlib
@@ -1586,13 +1587,24 @@ class GvrMainKernel:
         # that branch as soon as it knows the row's length and then exits, so the
         # smem window can start at the smem base and the streaming body never sees
         # such a row.
+        # On the SPLIT engines with K <= 1024 (KPT 1), rows of k < n <= 2048
+        # columns run on the CTA's first 512 threads instead, with the register
+        # family's 512-thread VPT 1 DEG rung (route()'s rung for 1024 < n <= 2048
+        # at tight capacity; CMP 2048 holds the whole row) and named barrier 1,
+        # while the other warps leave. On such a row the 1024-thread VPT 2 body
+        # costs ~0.7 us (25%) more.
         self.reg_vpt = int(reg_vpt)
-        self.regs = []  # (row capacity, embedded body, smem window bytes), narrowest first
+        self.regs = []  # (row capacity, embedded body, smem window bytes, CMP), narrowest first
+        self.reg_nar = None  # the 512-thread rung, same tuple
         if self.reg_vpt:
             assert self.varlen and not self.prefill and blk in (512, 1024) and self.reg_vpt in (2, 4)
-            nbh = 2 * blk
-            for vpt in (2, 4)[: self.reg_vpt // 2]:
-                cap = blk * vpt * 4
+            # (threads, VPT, MINB, KPT, DEG, NBH, CMP) per rung
+            rungs = [(blk, v, minb, kpt, False, 2 * blk, REG_CMP) for v in (2, 4)]
+            rungs = rungs[: self.reg_vpt // 2]
+            if kpt == 1 and self.split:
+                rungs.append((512, 1, 4, 1, True, NB__reg, 2048))
+            for tb, vpt, mb, kp, deg, nbh, cmp in rungs:
+                cap = tb * vpt * 4
                 # page-table entries a register row can span (the reg family's rule)
                 reg_pt = 0
                 if self.paged:
@@ -1600,12 +1612,12 @@ class GvrMainKernel:
                     if pages <= 1024:
                         reg_pt = 1 << max(pages - 1, 0).bit_length()
                 body = GvrTopkRegKernel(
-                    blk,
+                    tb,
                     vpt,
-                    minb,
-                    kpt,
+                    mb,
+                    kp,
                     cur=True,
-                    deg=False,
+                    deg=deg,
                     img=False,
                     nbh=nbh,
                     varlen=True,
@@ -1620,11 +1632,15 @@ class GvrMainKernel:
                     # main serves more rows than SMs
                     stage_out=blk == 1024,
                     embedded=True,
+                    bar_id=1 if tb < blk else 0,
                 )
-                win = STATIC_BYTES + (nbh + 2 * REG_CMP) * 4 + 4 * reg_pt
+                win = STATIC_BYTES + (nbh + 2 * cmp) * 4 + 4 * reg_pt
                 # + k staged outputs (k <= KPT * BLK)
                 assert win + 4 * kpt * blk <= self.dyn_bytes, "register window must fit the smem"
-                self.regs.append((cap, body, win))
+                if tb < blk:
+                    self.reg_nar = (cap, body, win, cmp)
+                else:
+                    self.regs.append((cap, body, win, cmp))
             self.reg_cap = self.regs[-1][0]
 
     # ------------------------------------------------------------------
@@ -1730,17 +1746,35 @@ class GvrMainKernel:
         SPLIT row ranks it; the other parts never touch the slab, so the row
         owes no arrivals and its g_off / g_don stay zero."""
         if part == cutlass.Int32(0):
-            if cutlass.const_expr(len(self.regs) == 1):
-                self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
-            else:
-                if n_row <= cutlass.Int32(self.regs[0][0]):
+            # k < n <= 2048: the 512-thread rung. n <= k rows keep the 1024-thread
+            # rung, whose identity emit covers k <= 1024 columns in one pass.
+            nar = cutlass.Int32(0)
+            if cutlass.const_expr(self.reg_nar is not None):
+                if n_row > k:
+                    if n_row <= cutlass.Int32(self.reg_nar[0]):
+                        nar = cutlass.Int32(1)
+            # (the 512-thread rung's code goes last: placed first, it made ptxas
+            # spill in the other rungs and the streaming body of the unpaged engines)
+            if nar == cutlass.Int32(0):
+                if cutlass.const_expr(len(self.regs) == 1):
                     self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
                 else:
-                    self._reg_rank(1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                    if n_row <= cutlass.Int32(self.regs[0][0]):
+                        self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                    else:
+                        self._reg_rank(1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+            else:
+                if cutlass.const_expr(self.reg_nar is not None):
+                    # the first 512 threads rank it; the others go straight to
+                    # the exit, never reaching its named barrier
+                    tid, _, _ = cute.arch.thread_idx()
+                    if tid < cutlass.Int32(self.reg_nar[1].blk):
+                        self._reg_rank(-1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
 
     @cute.jit
     def _reg_rank(self, vi: cutlass.Constexpr, logits, pre_idx, kv_lens, out, n_row, k, row, sbase):
-        _, body, win = self.regs[vi]
+        # vi: index into regs, -1 = the 512-thread rung
+        _, body, win, cmp = self.reg_nar if vi < 0 else self.regs[vi]
         smem_bytes = cutlass.Int32(win)
         if cutlass.const_expr(body.stage_out):
             smem_bytes = smem_bytes + k * cutlass.Int32(4)
@@ -1753,7 +1787,7 @@ class GvrMainKernel:
             kv_lens,
             out,
             n_row,
-            cutlass.Int32(REG_CMP),
+            cutlass.Int32(cmp),
             cutlass.Int32(QUADC if self.blk == 1024 else 1024),
             smem_bytes,
             row,
