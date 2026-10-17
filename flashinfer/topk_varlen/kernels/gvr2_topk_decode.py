@@ -1537,6 +1537,10 @@ class GvrMainKernel:
         self.pfd = (u if u < 4 else 4) if minb <= 2 else 0
         self.pf = self.pfd > 0
         self.natt = 1 if split else 3
+        # SPLIT live part count (varlen): a row of at most SOLO float4s (one
+        # tile, or the SCPB columns a CTA stages in smem) runs on part 0 alone
+        # (see the varlen prologue)
+        self.solo_f4 = max(blk * u, self.scpb >> 2)
         # smem blob byte map: cbuf/cbuf2 alias @0,
         # ck64 @ 4*(VSTG ? 2*(SCPB+4) : SCPB+4), size (CMPB+1)*8
         self.ck_off = 4 * ((2 * (self.scpb + 4)) if self.vstg else (self.scpb + 4))
@@ -1696,12 +1700,14 @@ class GvrMainKernel:
         # `return` in CuTe DSL: they run the body as a zero-work pass
         # (n = 0, TGT = INT_MAX so no rung ever accepts) and the identity/pad
         # emission happens in the epilogue at the end of the kernel.  Every
-        # value below is a pure function of `row`, so all R split CTAs of a
+        # value below is a pure function of `row`, so all split CTAs of a
         # row (and all threads) compute identical scalars — grid-uniform per
         # row by construction.
         short = cutlass.Int32(0)
         n_row = cutlass.Int32(0)
         tsh_run = cutlass.Int32(1)
+        # SPLIT: parts that take this row (varlen: from its live length, below)
+        r_eff = R
         # prefill window offset: lead = ks & 3 low lanes masked, col0 = ks
         # rounded down to a float4 boundary (declared before the dynamic ifs
         # per the scoping rule; stay 0 in every non-prefill compile).
@@ -1780,6 +1786,22 @@ class GvrMainKernel:
                 TGT2 = cutlass.Int32(0)
                 if cutlass.const_expr(self.split):
                     Q = (n4v + cutlass.Int32(self.r_const - 1)) // cutlass.Int32(self.r_const)
+                    # Live part count. grid.x = R is sized for the capture-time
+                    # envelope, so the R-way split hands each part of a short row
+                    # a sliver far below one tile, and every part still pays the
+                    # sample, the scans and the slab protocol. A row of at most
+                    # SOLO float4s runs on part 0 alone, which ranks it in place
+                    # (no slab; P3 hand-off). A pure function of the row, so
+                    # every part computes the same r_eff; the election counts it.
+                    r_eff = cutlass.Int32(self.r_const)
+                    if n4v <= cutlass.Int32(self.solo_f4):
+                        r_eff = cutlass.Int32(1)
+                        Q = n4v
+                    # Parts past r_eff own no columns: they leave through the
+                    # short-row exits (no ladder, no body, and the identity
+                    # epilogue is part 0's), so they never touch the slab.
+                    if part >= r_eff:
+                        short = cutlass.Int32(1)
                 else:
                     Q = cutlass.Int32(0)
             # per-row TSH-floor runtime gate (CUDA parity: b>15 && k<=1024 in
@@ -1832,6 +1854,12 @@ class GvrMainKernel:
             # (static like s_x4, so dyn_bytes keeps CUDA dispatch parity)
             s_lad = smem.allocate_tensor(
                 cutlass.Int32, cute.make_ordered_layout((4,), order=(0,)), byte_alignment=16
+            )
+        if cutlass.const_expr(self.varlen and self.split):
+            # live part count, parked by thread 0 for the slab hand-off so no
+            # register is held across P1..P3 (64-register wall)
+            s_reff = smem.allocate_tensor(
+                cutlass.Int32, cute.make_ordered_layout((1,), order=(0,)), byte_alignment=4
             )
         if cutlass.const_expr(self.prefill):
             # per-row lead (0..3) broadcast slot: warp0 publishes it under the
@@ -1983,7 +2011,7 @@ class GvrMainKernel:
                     # the isqrt fixup loops collapse to single steps (the f32
                     # sqrt of an exactly-representable int (6n <= 2^23) is
                     # within 1 of isqrt, so one correction per side suffices).
-                    # Q (chunk ownership) stays exact — compile-time divisor.
+                    # Q (chunk ownership) stays exact (integer arithmetic).
                     x6 = cutlass.Int32(6) * n
                     ri = cutlass.Int32(cmath.sqrt(cutlass.Float32(x6)))
                     if ri * ri > x6:
@@ -2069,6 +2097,8 @@ class GvrMainKernel:
                     s_lad[1] = SS2
                     s_lad[2] = TGT
                     s_lad[3] = TGT2
+                    if cutlass.const_expr(self.split):
+                        s_reff[0] = r_eff
                     if cutlass.const_expr(self.prefill):
                         s_lead[0] = lead
                         if cutlass.const_expr(self.prefill_abs):
@@ -2548,120 +2578,150 @@ class GvrMainKernel:
 
                 if cutlass.const_expr(self.split):
                     # ---- SLAB HAND-OFF; exactly ONE attempt ----
-                    if tidx == cutlass.Int32(0):
-                        pgo = cute.make_ptr(
-                            cutlass.Int32,
-                            goff_addr + row64 * cutlass.Int64(4),
-                            cute.AddressSpace.gmem,
-                            assumed_align=4,
-                        )
-                        s_scal[3] = cutlass.Int32(cute.arch.atomic_add(pgo, myn))
-                    cute.arch.barrier()  # ---- barrier (slab offset) ----
-                    base = s_scal[3]
-                    if myn <= cutlass.Int32(SCPB):  # coalesced publish
+                    # r_eff == 1: this CTA holds the whole row and its staged
+                    # candidates (myn <= SCPB) sit in s_cbuf2, so it ranks them in
+                    # place; the slab round trip (offset atomic, publish, release
+                    # fence, arrival atomic, L2 re-read) only merges parts. A solo
+                    # row that overflowed its stage takes the slab path, as the
+                    # only (hence last) arrival. Both paths fill s_hist for the
+                    # crossing scan below.
+                    r_live = R
+                    solo = cutlass.Int32(0)
+                    if cutlass.const_expr(self.varlen):
+                        r_live = s_reff[0]
+                        if r_live == cutlass.Int32(1):
+                            if myn <= cutlass.Int32(SCPB):
+                                solo = cutlass.Int32(1)
+                    ranked = cutlass.Int32(0)
+                    if solo != cutlass.Int32(0):
+                        listN = myn
                         i = tidx
-                        while i < myn:
-                            p = base + i
-                            if p < cutlass.Int32(GCAP__main):
-                                _st_g_u64(gbuf_row + cutlass.Int64(p) * cutlass.Int64(8), s_cbuf2[i])
+                        while i < listN:
+                            spk = s_cbuf2[i]
+                            svx = cutlass.Int32(cutlass.Uint32(spk & cutlass.Uint64(0xFFFFFFFF)))
+                            sbq = C.f2s_rz((C.f32_of_i32(svx) - TF) * SC)
+                            if sbq > cutlass.Int32(NBS - 1):
+                                sbq = cutlass.Int32(NBS - 1)
+                            _red_shared_add1(hb_pin + (sbq << cutlass.Int32(2)))
                             i = i + cutlass.Int32(BLK)
-                    else:  # overflow re-sweep
+                        ranked = cutlass.Int32(1)
+                    else:
                         if tidx == cutlass.Int32(0):
-                            s_scal[0] = cutlass.Int32(0)
-                        cute.arch.barrier()  # ---- barrier (overflow reset) ----
-                        lo2 = c0 << cutlass.Int32(2)
-                        hi2 = c1 << cutlass.Int32(2)
-                        i = lo2 + tidx
-                        while i < hi2:
-                            x = C.ldg_f32(x_addr, i)
-                            if x >= TF:
-                                pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
-                                p = base + pq
-                                if p < cutlass.Int32(GCAP__main):
-                                    _st_g_u64(
-                                        gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
-                                        (cutlass.Uint64(cutlass.Uint32(i)) << cutlass.Uint64(32))
-                                        | cutlass.Uint64(C.u32_of_f32(x)),
-                                    )
-                            i = i + cutlass.Int32(BLK)
-                        i = tidx  # true tail
-                        while i < tailn:
-                            x = C.ldg_f32(x_addr, tail0 + i)
-                            if x >= TF:
-                                pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
-                                p = base + pq
-                                if p < cutlass.Int32(GCAP__main):
-                                    _st_g_u64(
-                                        gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
-                                        (
-                                            cutlass.Uint64(cutlass.Uint32(tail0 + i))
-                                            << cutlass.Uint64(32)
-                                        )
-                                        | cutlass.Uint64(C.u32_of_f32(x)),
-                                    )
-                            i = i + cutlass.Int32(BLK)
-                    cute.arch.barrier()  # ---- barrier (slab publish) ----
-                    if tidx == cutlass.Int32(0):  # release + RMW
-                        C.threadfence_gpu()
-                        pdon = cute.make_ptr(
-                            cutlass.Int64,
-                            gdon_addr + row64 * cutlass.Int64(8),
-                            cute.AddressSpace.gmem,
-                            assumed_align=8,
-                        )
-                        s_pk[0] = C.atomic_add_u64_gpu(
-                            pdon, cutlass.Int64(1 << 32) + cutlass.Int64(myn)
-                        )
-                    cute.arch.barrier()  # ---- barrier (arrival word) ----
-                    pk = s_pk[0]
-                    alive = cutlass.Int32(0)  # last-CTA test
-                    if cutlass.Int32(pk >> cutlass.Int64(32)) == R - cutlass.Int32(1):
-                        alive = cutlass.Int32(1)
-                    if alive != cutlass.Int32(0):
-                        C.threadfence_gpu()  # acquire
-                        if tidx == cutlass.Int32(0):  # ZERO-RESTORE
-                            _st_g_u32(goff_addr + row64 * cutlass.Int64(4), cutlass.Int32(0))
-                            _st_g_u64(gdon_addr + row64 * cutlass.Int64(8), cutlass.Uint64(0))
-                        total = cutlass.Int32(pk & cutlass.Int64(0xFFFFFFFF)) + myn
-                        if total <= cutlass.Int32(GCAP__main):  # one-pass consume
-                            listN = total
-                            if total > cutlass.Int32(SCPB):
-                                fromg = cutlass.Int32(1)
-                            i = tidx
-                            while i < listN:
-                                gvx, gvy = C._ldcg_v2_i32(
-                                    gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
-                                )
-                                if fromg == cutlass.Int32(0):
-                                    s_cbuf2[i] = (
-                                        cutlass.Uint64(cutlass.Uint32(gvy)) << cutlass.Uint64(32)
-                                    ) | cutlass.Uint64(cutlass.Uint32(gvx))
-                                bq = C.f2s_rz((C.f32_of_i32(gvx) - TF) * SC)
-                                if bq > cutlass.Int32(NBS - 1):
-                                    bq = cutlass.Int32(NBS - 1)
-                                # resultless red off the pinned hist base
-                                _red_shared_add1(hb_pin + (bq << cutlass.Int32(2)))
-                                i = i + cutlass.Int32(BLK)
-                            cute.arch.barrier()  # ---- barrier (slab histogram) ----
-                            C.scan_cross0(
-                                s_hist,
-                                k,
-                                tidx,
-                                s_res,
-                                cutlass.Int32(0),
-                                cutlass.Int32(0),
-                                s_hist,
-                                nb=NBS,
-                                zero=False,
+                            pgo = cute.make_ptr(
+                                cutlass.Int32,
+                                goff_addr + row64 * cutlass.Int64(4),
+                                cute.AddressSpace.gmem,
+                                assumed_align=4,
                             )
-                            cute.arch.barrier()  # ---- barrier (scan publish) ----
-                            if s_res[C.RES_TOT] >= k:
-                                valid = cutlass.Int32(1)
-                                complete = cutlass.Int32(1)
-                                above = s_res[C.RES_ABOVE]
-                                m = s_res[C.RES_M]
-                                need = k - above
-                                B = s_res[C.RES_B]
+                            s_scal[3] = cutlass.Int32(cute.arch.atomic_add(pgo, myn))
+                        cute.arch.barrier()  # ---- barrier (slab offset) ----
+                        base = s_scal[3]
+                        if myn <= cutlass.Int32(SCPB):  # coalesced publish
+                            i = tidx
+                            while i < myn:
+                                p = base + i
+                                if p < cutlass.Int32(GCAP__main):
+                                    _st_g_u64(gbuf_row + cutlass.Int64(p) * cutlass.Int64(8), s_cbuf2[i])
+                                i = i + cutlass.Int32(BLK)
+                        else:  # overflow re-sweep
+                            if tidx == cutlass.Int32(0):
+                                s_scal[0] = cutlass.Int32(0)
+                            cute.arch.barrier()  # ---- barrier (overflow reset) ----
+                            lo2 = c0 << cutlass.Int32(2)
+                            hi2 = c1 << cutlass.Int32(2)
+                            i = lo2 + tidx
+                            while i < hi2:
+                                x = C.ldg_f32(x_addr, i)
+                                if x >= TF:
+                                    pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                                    p = base + pq
+                                    if p < cutlass.Int32(GCAP__main):
+                                        _st_g_u64(
+                                            gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
+                                            (cutlass.Uint64(cutlass.Uint32(i)) << cutlass.Uint64(32))
+                                            | cutlass.Uint64(C.u32_of_f32(x)),
+                                        )
+                                i = i + cutlass.Int32(BLK)
+                            i = tidx  # true tail
+                            while i < tailn:
+                                x = C.ldg_f32(x_addr, tail0 + i)
+                                if x >= TF:
+                                    pq = C.atomic_add_cta(s_scal.iterator + 0, cutlass.Int32(1))
+                                    p = base + pq
+                                    if p < cutlass.Int32(GCAP__main):
+                                        _st_g_u64(
+                                            gbuf_row + cutlass.Int64(p) * cutlass.Int64(8),
+                                            (
+                                                cutlass.Uint64(cutlass.Uint32(tail0 + i))
+                                                << cutlass.Uint64(32)
+                                            )
+                                            | cutlass.Uint64(C.u32_of_f32(x)),
+                                        )
+                                i = i + cutlass.Int32(BLK)
+                        cute.arch.barrier()  # ---- barrier (slab publish) ----
+                        if tidx == cutlass.Int32(0):  # release + RMW
+                            C.threadfence_gpu()
+                            pdon = cute.make_ptr(
+                                cutlass.Int64,
+                                gdon_addr + row64 * cutlass.Int64(8),
+                                cute.AddressSpace.gmem,
+                                assumed_align=8,
+                            )
+                            s_pk[0] = C.atomic_add_u64_gpu(
+                                pdon, cutlass.Int64(1 << 32) + cutlass.Int64(myn)
+                            )
+                        cute.arch.barrier()  # ---- barrier (arrival word) ----
+                        pk = s_pk[0]
+                        alive = cutlass.Int32(0)  # last-CTA test
+                        if cutlass.Int32(pk >> cutlass.Int64(32)) == r_live - cutlass.Int32(1):
+                            alive = cutlass.Int32(1)
+                        if alive != cutlass.Int32(0):
+                            C.threadfence_gpu()  # acquire
+                            if tidx == cutlass.Int32(0):  # ZERO-RESTORE
+                                _st_g_u32(goff_addr + row64 * cutlass.Int64(4), cutlass.Int32(0))
+                                _st_g_u64(gdon_addr + row64 * cutlass.Int64(8), cutlass.Uint64(0))
+                            total = cutlass.Int32(pk & cutlass.Int64(0xFFFFFFFF)) + myn
+                            if total <= cutlass.Int32(GCAP__main):  # one-pass consume
+                                listN = total
+                                if total > cutlass.Int32(SCPB):
+                                    fromg = cutlass.Int32(1)
+                                i = tidx
+                                while i < listN:
+                                    gvx, gvy = C._ldcg_v2_i32(
+                                        gbuf_row + cutlass.Int64(i) * cutlass.Int64(8)
+                                    )
+                                    if fromg == cutlass.Int32(0):
+                                        s_cbuf2[i] = (
+                                            cutlass.Uint64(cutlass.Uint32(gvy)) << cutlass.Uint64(32)
+                                        ) | cutlass.Uint64(cutlass.Uint32(gvx))
+                                    bq = C.f2s_rz((C.f32_of_i32(gvx) - TF) * SC)
+                                    if bq > cutlass.Int32(NBS - 1):
+                                        bq = cutlass.Int32(NBS - 1)
+                                    # resultless red off the pinned hist base
+                                    _red_shared_add1(hb_pin + (bq << cutlass.Int32(2)))
+                                    i = i + cutlass.Int32(BLK)
+                                ranked = cutlass.Int32(1)
+                    if ranked != cutlass.Int32(0):
+                        cute.arch.barrier()  # ---- barrier (slab histogram) ----
+                        C.scan_cross0(
+                            s_hist,
+                            k,
+                            tidx,
+                            s_res,
+                            cutlass.Int32(0),
+                            cutlass.Int32(0),
+                            s_hist,
+                            nb=NBS,
+                            zero=False,
+                        )
+                        cute.arch.barrier()  # ---- barrier (scan publish) ----
+                        if s_res[C.RES_TOT] >= k:
+                            valid = cutlass.Int32(1)
+                            complete = cutlass.Int32(1)
+                            above = s_res[C.RES_ABOVE]
+                            m = s_res[C.RES_M]
+                            need = k - above
+                            B = s_res[C.RES_B]
                     running = cutlass.Int32(0)  # break (NATT==1)
                 else:
                     # ---- non-split verify + rung ladder ----

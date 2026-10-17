@@ -663,6 +663,189 @@ def test_gvr2_warmup_then_capture():
 
 
 # ---------------------------------------------------------------------------
+# SPLIT main: live part count (rows far shorter than the launch envelope)
+# ---------------------------------------------------------------------------
+
+
+def _split_parts(rows, msl_c, top_k, next_n, cr, hint_free, page_shift=None):
+    """R (grid.x) of the cached SPLIT-main launcher for this geometry."""
+    key = (
+        rows,
+        msl_c,
+        top_k,
+        msl_c,
+        next_n,
+        cr,
+        hint_free,
+        page_shift,
+        _host._arch_token(),
+        _host._sm_count(),
+    )
+    lc = _host._VARLEN_CACHE.get(key)
+    assert lc is not None and lc[0] == "main", f"not a main launcher: {key}"
+    return lc[2][5]
+
+
+def _split_row_lens(msl_c, top_k):
+    """Compressed row lengths around every per-row decision of the split slab:
+    short (n <= k), the unsampled band (n <= 8192), both sides of the one-part
+    bound (8192 columns at U <= 2, one tile = 16384 / 32768 columns at U = 4 /
+    8), and the envelope itself."""
+    lens = [
+        top_k // 2,
+        top_k,
+        top_k + 1,
+        2 * top_k + 4,
+        4096,
+        4100,
+        8192,
+        8196,
+        16384,
+        16388,
+        32768,
+        32772,
+        131076,
+        msl_c // 2 + 4,
+        msl_c - 3,
+        msl_c,
+    ]
+    return [n for n in lens if n <= msl_c]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k,next_n,cr",
+    [
+        (1, 1048832, 512, 1, 1),  # V4.1 c1 width: R = 148, U = 1
+        (4, 262208, 1024, 1, 4),  # DSv4 c4 width (cr = 4): R = 37
+        (16, 262208, 512, 1, 1),  # R = 9, U = 4
+        (8, 1048640, 2048, 1, 1),  # GLM-5.2 width, K = 2048: R = 18, U = 8
+        (32, 524416, 2048, 2, 1),  # next_n = 2, K = 2048 (never clus): R = 4
+    ],
+)
+def test_gvr2_split_rows_far_below_envelope(rows, msl_c, top_k, next_n, cr):
+    """SPLIT launches are sized by the capture-time envelope, but a row of at
+    most one tile (or 8192 columns) runs on one part without the slab; longer
+    rows use all R parts. Rows of every length up to the envelope (no row
+    pinned at the envelope), hinted and hint-free, must stay exact."""
+    batch = rows // next_n
+    pool = _split_row_lens(msl_c, top_k)
+    for hint_free in (False, True):
+        for start in range(0, len(pool), batch):
+            kv = [pool[(start + j) % len(pool)] * cr for j in range(batch)]
+            logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+                kv, next_n, cr, top_k, seed=start + rows, msl_c=msl_c
+            )
+            indices, _ = _run_gvr2(
+                logits,
+                seq_lens,
+                top_k,
+                None if hint_free else pre_idx,
+                next_n=next_n,
+                compress_ratio=cr,
+            )
+            _check_varlen_rows(logits, indices, n_r, top_k)
+        assert _split_parts(rows, msl_c, top_k, next_n, cr, hint_free) > 1
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k,page_size",
+    [
+        (1, 1048832, 512, None),  # R = 148
+        (8, 262208, 1024, None),  # R = 18
+        (4, 1048640, 2048, None),  # R = 37, K = 2048
+        (2, 1048832, 512, 128),  # paged output (V4.1 c1 index pages)
+    ],
+)
+def test_gvr2_split_cuda_graph_replay_live_parts(rows, msl_c, top_k, page_size):
+    """The live part count is re-derived from seq_lens at every replay: capture
+    once, then replay with every row at the envelope (all R parts), every row
+    one part (no slab), short rows, and mixed lengths, in an order that flips
+    each row between the slab and the slab-free path. Every replay must be
+    exact and must leave the slab's arrival counters at zero (a counter left
+    behind would corrupt the next replay's last-CTA election)."""
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    logits = torch.randn(rows, msl_c, generator=gen, device=_DEV) - 2.0
+    seq_lens = torch.full((rows,), 4096, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ws = torch.zeros(
+        _host.workspace_bytes() // 4, dtype=torch.int32, device=_DEV
+    )  # explicit slab so its counters can be inspected
+    kw = dict(out_indices=out, workspace={"gvr2_workspace": ws})
+    pt = None
+    if page_size is not None:
+        pages = (msl_c + page_size - 1) // page_size
+        pt = torch.stack(
+            [
+                torch.randperm(4 * pages + 7, generator=gen, device=_DEV)[:pages]
+                for _ in range(rows)
+            ]
+        ).to(torch.int32)
+        kw.update(page_table=pt, page_size=page_size)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        _run_gvr2(logits, seq_lens, top_k, None, **kw)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    assert (
+        _split_parts(
+            rows,
+            msl_c,
+            top_k,
+            1,
+            1,
+            True,
+            None if page_size is None else page_size.bit_length() - 1,
+        )
+        > 1
+    )
+    pool = _split_row_lens(msl_c, top_k)
+    plans = [
+        [msl_c] * rows,  # every part of every row
+        [top_k + 1] * rows,  # one part, unsampled: no slab
+        [msl_c - 3] * rows,  # back to all parts (counters must be clean)
+        [top_k // 2] * rows,  # short rows only
+        [pool[(3 * j + 5) % len(pool)] for j in range(rows)],
+        [8196 if j % 2 else 32768 for j in range(rows)],
+        [pool[(5 * j + 2) % len(pool)] for j in range(rows)],
+        [msl_c] * rows,
+    ]
+    for kv in plans:
+        seq_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
+        logits.normal_(generator=gen)
+        n_r = _row_valid_lens(kv, rows, 1, 1, msl_c)
+        for r in range(rows):
+            logits[r, n_r[r] :] = 3e38
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        assert int(ws[: 2048 // 4].abs().sum()) == 0, f"slab counters left set: {kv}"
+        if pt is None:
+            _check_varlen_rows(logits, out, n_r, top_k)
+            continue
+        loc, _ = _run_gvr2(logits, seq_lens, top_k, None)
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits, loc, n_r, top_k)
+        shift = page_size.bit_length() - 1
+        l64 = loc.to(torch.int64)
+        req = torch.arange(rows, device=_DEV).unsqueeze(1)
+        phys = (pt.to(torch.int64)[req, (l64 >> shift).clamp_min(0)] << shift) | (
+            l64 & (page_size - 1)
+        )
+        want = torch.where(loc >= 0, phys.to(torch.int32), loc)
+        assert torch.equal(
+            torch.sort(out, dim=1).values, torch.sort(want, dim=1).values
+        ), f"paged replay mismatch: {kv}"
+
+
+# ---------------------------------------------------------------------------
 # backend registration / guards / cross-backend
 # ---------------------------------------------------------------------------
 
