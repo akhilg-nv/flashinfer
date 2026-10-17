@@ -914,6 +914,22 @@ def _regclus_stage_out(num_rows: int, k: int, paged: bool) -> bool:
     return bool(_REGCLUS_STAGE_OUT) and paged and (k <= 1024 or num_rows >= 16)
 
 
+def _main_reg_vpt(blk: int, split: bool) -> int:
+    """Widest VPT of the in-kernel register path of a decode ``main`` engine
+    (FlashInfer-local; 0 = off). A CUDA-graph launch is planned for the
+    capacity, so it streams rows far shorter than that; with the path compiled
+    in, a row of at most BLK * VPT * 4 columns runs the register family's body
+    on its CTA instead (``GvrMainKernel`` ``reg_vpt``: the VPT 2 body for rows
+    up to BLK * 8, the VPT 4 body above), as SGLang's topk_v2 picks its register
+    path per row. VPT 4 is that family's widest rung at 1024 threads: rows up to
+    16384 columns. SPLIT engines only (1024 threads, up to 16 rows, 32 at
+    K = 2048): on the one-CTA-per-row engines the register body's code moves
+    ptxas's allocation of the streaming loops off the uniform datapath, 1-3%
+    on long rows, while the SPLIT streaming loops never use it. A pure
+    function of the engine tuple, so the warmup band key needs no new axis."""
+    return 4 if split and blk == 1024 else 0
+
+
 def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
@@ -1070,6 +1086,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
             hint_free=hint_free,
             pt_smem=pt_smem,
             pdl=_DECODE_PDL,
+            reg_vpt=_main_reg_vpt(tpl[0], tpl[5]),
             **pg,
         )
     )
