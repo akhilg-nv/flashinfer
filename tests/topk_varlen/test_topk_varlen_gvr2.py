@@ -1442,6 +1442,9 @@ _SAMPLE_GATE_CASES = [
     # rows take the in-kernel register path (test_gvr2_main_register_path_*)
     (148, 130944, 512, 16384, None),  # one-wave 1024-thread slab
     (75, 65540, 512, 16384, None),  # the same slab: first rows / first width
+    (128, 130944, 1024, 16384, None),  # the same at K = 1024 (aim 7k/4: gate at 2k)
+    (64, 130944, 2048, 16384, None),  # K = 2048: the slab from 33 rows on
+    (128, 130944, 1024, 16384, 64),  # paged: DSv4 page size
     (149, 65472, 512, 4096, None),  # two-CTA (512, U 8, MINB 2) slab
     (296, 65472, 1024, 4096, None),  # the same at K = 1024 (aim 7k/4)
     (297, 32768, 1024, 4096, None),  # (256, U 8, MINB 4) slab
@@ -1580,6 +1583,37 @@ def test_gvr2_onecta_streamed_rows(rows, width, top_k, page_size, pattern):
     register path, around the crossover of the 7k/4 aim with sqrt(6 n) (K = 512:
     133,803 columns), multi-tile and full-width rows, and short rows."""
     cols = [8193, 8195, 8199, 16385, 32771, 98304, 133802, 133804, 131075, width]
+    cols += [top_k, top_k + 1, 2 * top_k + 1, 0]
+    n_r = [min(cols[r % len(cols)], width) for r in range(rows)]
+    logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width + top_k)
+    _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
+
+
+_ONECTA_WAVE_CASES = [
+    # rows, width, top_k, page size: the one-wave 1024-thread slab (big regime,
+    # R = 1) at K >= 1024 (aim 7k/4), at widths that compile the register path in
+    (128, 262144, 1024, None),
+    # past the aim's crossover with sqrt(6 n): 535,210 columns
+    (80, 540672, 1024, None),
+    (64, 262144, 2048, None),  # K = 2048: the slab from 33 rows on (KPT 2)
+    (144, 163840, 2048, 64),  # paged: DSv4 page size
+]
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,page_size,pattern", _with_patterns(_ONECTA_WAVE_CASES)
+)
+def test_gvr2_onecta_wave_slab_rows(rows, width, top_k, page_size, pattern):
+    """The one-wave 1024-thread slab at K >= 1024 aims at 7k/4 (the launch's tail
+    scalar) and ranks exactly under hard scores: rows just past the register path,
+    32K-column rows and a few columns more, multi-tile and full-width rows, rows
+    around the aim's crossover with sqrt(6 n) (K = 1024), and short rows."""
+    page_shift = None if page_size is None else page_size.bit_length() - 1
+    lc = _host._varlen_launcher(rows, width, top_k, width, 1, 1, True, page_shift)
+    assert lc[0] == "main" and lc[2][5] == 1, lc  # one CTA per row
+    assert lc[3][0] == (7 * top_k) // 4, lc[3]  # aim_base
+    cols = [16385, 16388, 32768, 32773, 65540, 131077, 535209, 535212, width]
     cols += [top_k, top_k + 1, 2 * top_k + 1, 0]
     n_r = [min(cols[r % len(cols)], width) for r in range(rows)]
     logits = _hard_logits(pattern, n_r, width, top_k, seed=rows + width + top_k)
