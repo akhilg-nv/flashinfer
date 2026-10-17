@@ -1292,6 +1292,11 @@ def _main_reg_cap(rows, msl_c, top_k):
     return blk * _host._main_reg_vpt(blk, plan["tpl"][5], msl_c) * 4
 
 
+# K <= 1024 SPLIT engines rank rows of top_k < n <= 2048 columns on their first
+# 512 threads (the reg family's VPT 1 rung for that band; GvrMainKernel `reg_nar`)
+_NAR_CAP = 2048
+
+
 def test_gvr2_main_register_path_policy():
     """The SPLIT main engines always compile the register path in; the
     one-CTA-per-row engines (1024 and 512 threads) only for an envelope of at
@@ -1360,6 +1365,40 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
 
 @requires_gvr2
 @pytest.mark.parametrize(
+    "rows,msl_c,top_k,next_n,cr", [(16, 131136, 512, 1, 1), (8, 131136, 1024, 2, 4)]
+)
+def test_gvr2_main_register_path_narrow_rows(rows, msl_c, top_k, next_n, cr):
+    """The bounds of the 512-thread rung (top_k < n <= 2048), hinted and
+    hint-free, next to short, wider register and streaming rows of the same
+    SPLIT launch: k, k + 1 and every n % 4 above it, the band's last columns,
+    2049, 3k, an empty row and a streaming row."""
+    edges = [top_k, top_k + 1, top_k + 2, top_k + 3, top_k + 4, _NAR_CAP - 3]
+    edges += [_NAR_CAP - 1, _NAR_CAP, _NAR_CAP + 1, 3 * top_k, 0, msl_c - 5]
+    reqs = rows // next_n
+    gen = torch.Generator().manual_seed(rows + top_k)
+    # every edge, the last launch filled with random rows of the band
+    fill = torch.randint(top_k + 1, _NAR_CAP + 1, (-len(edges) % reqs,), generator=gen)
+    targets = edges + fill.tolist()
+    for i in range(0, len(targets), reqs):
+        kv = [t * cr + next_n - 1 for t in targets[i : i + reqs]]
+        logits, seq_lens, pre_idx, n_r, _ = _make_varlen_case(
+            kv, next_n, cr, top_k, seed=rows + i, msl_c=msl_c
+        )
+        for hint_free in (False, True):
+            indices, _ = _run_gvr2(
+                logits,
+                seq_lens,
+                top_k,
+                None if hint_free else pre_idx,
+                next_n=next_n,
+                compress_ratio=cr,
+            )
+            _assert_family(rows, msl_c, top_k, next_n, cr, "main", hint_free=hint_free)
+            _check_varlen_rows(logits, indices, n_r, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
     "rows,msl_c",
     [(9, 131136), (16, 131136), (128, 131136), (160, 65600)],
     ids=["split9", "split16", "cta1024", "cta512"],
@@ -1367,13 +1406,16 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
 @pytest.mark.parametrize(
     "pattern", ["constant", "quantized4", "huge_flood_gt_k", "posinf", "neginf_tail"]
 )
-def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern):
+@pytest.mark.parametrize("band", ["vpt4", "narrow"])
+def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern, band):
     """Tie floods, +inf and an in-window -inf tail inside register-path rows of a
     main launch (the register body's escape and degenerate-bracket arms),
-    hinted and hint-free. Rows of cap - 3 columns put the last column outside
-    the float4 batch (n % 4 == 1)."""
-    top_k = 1024
-    n = _main_reg_cap(rows, msl_c, top_k) - 3
+    hinted and hint-free, on the VPT 4 body and on rows of the 512-thread
+    rung's band (SPLIT; the one-CTA engines rank those with their VPT 2 body).
+    Rows of cap - 3 columns put the last column outside the float4 batch
+    (n % 4 == 1)."""
+    top_k = 1024 if band == "vpt4" else 512
+    n = (_main_reg_cap(rows, msl_c, top_k) if band == "vpt4" else _NAR_CAP) - 3
     gen = torch.Generator(device=_DEV).manual_seed(rows + len(pattern))
     if pattern == "posinf":
         x = torch.randn(rows, n, generator=gen, device=_DEV) * 2.0
@@ -1452,8 +1494,11 @@ def test_gvr2_main_register_path_graph_replay(rows, msl_c, top_k, paged):
         rnd(cap + 1, msl_c, rows),  # streaming (the SPLIT slab)
         _band_lengths(rows, top_k, cap, msl_c, gen),  # mixed
         rnd(0, top_k, rows),  # short
+        # the 512-thread rung's band (K < 2048)
+        rnd(top_k + 1, max(top_k + 1, _NAR_CAP), rows),
         rnd(top_k + 1, cap, rows),  # register again
         rnd(cap + 1, msl_c, rows),  # streaming after a register step
+        rnd(top_k + 1, _NAR_CAP + 1, rows),  # the rung's band and its upper edge
     ]
     for lens in steps:
         seq_lens.copy_(torch.tensor(lens, dtype=torch.int32, device=_DEV))
@@ -1866,9 +1911,11 @@ _INF_SHAPES = [
     # main at the v41block serving width (SPLIT), big, and 512-thread slabs; the
     # SPLIT engines rank rows of up to 16384 columns with the register body, and
     # so do the one-CTA engines from an envelope of _MAIN_REG_ENV register rows
-    # (main_big_reg; main_b512: 512 threads, rows of up to 8192 columns)
+    # (main_big_reg; main_b512: 512 threads, rows of up to 8192 columns); with
+    # K <= 1024 SPLIT rows of k < n <= 2048 take the 512-thread rung
     pytest.param(1, 131104, 4101, 2048, id="main_split"),
     pytest.param(1, 131104, 32773, 2048, id="main_split_stream"),
+    pytest.param(1, 131104, 2045, 512, id="main_split_narrow"),
     pytest.param(64, 131072, 32773, 2048, id="main_big"),
     pytest.param(64, 131104, 4101, 2048, id="main_big_reg"),
     pytest.param(160, 131072, 4101, 2048, id="main_b512"),
