@@ -522,12 +522,22 @@ def test_gvr2_workspace_override():
 
 
 def _assert_family(
-    rows, msl_c, top_k, next_n, cr, want, hint_free=False, n_env=None, page_shift=None
+    rows,
+    msl_c,
+    top_k,
+    next_n,
+    cr,
+    want,
+    hint_free=False,
+    n_env=None,
+    page_shift=None,
+    early_len=False,
 ):
     """The varlen launcher must admit the same family the free route picks.
     ``n_env`` is the launch envelope in columns (default: the buffer width
     ``msl_c``; a decode ``max_window_len`` bound sets it below that);
-    ``page_shift`` is log2 of the page size of paged output (None: unpaged)."""
+    ``page_shift`` is log2 of the page size of paged output (None: unpaged);
+    ``early_len``: the launcher of ``kv_lens_before_pdl_wait=True`` calls."""
     key = (
         rows,
         msl_c,
@@ -540,6 +550,8 @@ def _assert_family(
         _host._arch_token(),
         _host._sm_count(),
     )
+    if early_len:
+        key += ("early_len",)
     lc = _host._VARLEN_CACHE.get(key)
     assert lc is not None, f"launcher not cached for {key}"
     assert lc[0] == want, f"family {lc[0]} != {want} for {key}"
@@ -2132,6 +2144,361 @@ def test_gvr2_short_rows_graph_replay(rows, width, top_k, next_n, cr, family, pa
             col = inv[req, (o64 >> 6).clamp_min(0)] * 64 + (o64 & 63)
             got = torch.where(out >= 0, col, o64).to(torch.int32)
         _check_varlen_rows(logits, got, n_r, top_k)
+
+
+# ---------------------------------------------------------------------------
+# kv_lens_before_pdl_wait: the row length read before griddepcontrol.wait
+# ---------------------------------------------------------------------------
+
+
+def _mixed_kv(batch, top_k, next_n, cr, width, gen):
+    """Per-request kv lengths whose rows cover every length class: empty, one
+    column, exactly top_k columns, a register-path row (4 * top_k columns) and
+    random lengths up to the launch width."""
+    hi = width * cr
+    kinds = [0, 1, top_k * cr + cr - 1, min(4 * top_k * cr + cr - 1, hi), None]
+    return [
+        int(torch.randint(0, hi + 1, (1,), generator=gen))
+        if kinds[q % len(kinds)] is None
+        else kinds[q % len(kinds)]
+        for q in range(batch)
+    ]
+
+
+def _random_page_table(batch, width, page_size, seed):
+    """One distinct random physical page per (request, page)."""
+    gdev = torch.Generator(device=_DEV).manual_seed(seed)
+    pages = (width + page_size - 1) // page_size
+    return torch.stack(
+        [
+            torch.randperm(4 * pages + 7, generator=gdev, device=_DEV)[:pages]
+            for _ in range(batch)
+        ]
+    ).to(torch.int32)
+
+
+def _run_host(logits, seq_lens, top_k, next_n, cr, out, early, **kw):
+    """Hint-free decode call of the host entry (the flag is a host option)."""
+    _host.run_varlen(
+        logits,
+        None,
+        seq_lens,
+        out,
+        next_n=next_n,
+        compress_ratio=cr,
+        max_seq_len=logits.shape[1] * cr,
+        top_k=top_k,
+        kv_lens_before_pdl_wait=early,
+        **kw,
+    )
+
+
+@requires_gvr2
+@pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
+@pytest.mark.parametrize("rows,width,top_k,next_n,cr,family", _SHORT_SHAPES)
+def test_gvr2_kv_lens_before_pdl_wait_every_family(
+    rows, width, top_k, next_n, cr, family, paged
+):
+    """kv_lens_before_pdl_wait=True on every engine family: the launch reads the
+    row lengths before griddepcontrol.wait and returns the rows the default
+    engines return, for rows of every length class (empty, 1 and top_k
+    columns, register-path rows and rows up to the launch width)."""
+    gen = torch.Generator().manual_seed(rows + width)
+    kv = _mixed_kv(rows // next_n, top_k, next_n, cr, width, gen)
+    logits, seq_lens, _, n_r, _ = _make_varlen_case(
+        kv, next_n, cr, top_k, seed=rows + top_k, msl_c=width
+    )
+    kw = {}
+    if paged:
+        kw = dict(
+            page_table=_random_page_table(rows // next_n, width, 64, seed=rows),
+            page_size=64,
+        )
+    outs = {}
+    for early in (False, True):
+        out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+        _run_host(logits, seq_lens, top_k, next_n, cr, out, early, **kw)
+        torch.cuda.synchronize()
+        outs[early] = out
+    _assert_family(
+        rows,
+        width,
+        top_k,
+        next_n,
+        cr,
+        family,
+        hint_free=True,
+        page_shift=6 if paged else None,
+        early_len=True,
+    )
+    assert torch.equal(_sorted_rows(outs[True]), _sorted_rows(outs[False]))
+    if not paged:
+        _check_varlen_rows(logits, outs[True], n_r, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
+@pytest.mark.parametrize(
+    "rows,width,top_k,next_n,cr,family",
+    [(4, 8192, 2048, 2, 1, "reg")] + [_SHORT_SHAPES[i] for i in (2, 4, 7, 8, 9, 11)],
+    ids=["reg", "regclus", "clus", "split", "cta1024", "cta1024_streaming", "cta256"],
+)
+def test_gvr2_kv_lens_before_pdl_wait_graph_replay(
+    rows, width, top_k, next_n, cr, family, paged
+):
+    """A launch that reads the lengths before the PDL wait still reads them at
+    every replay: capture once, then rewrite seq_lens in place and replay with
+    every row short, every row longer than top_k, every row empty and mixed
+    lengths; each replay must return what the default engine returns eagerly."""
+    batch = rows // next_n
+    gen = torch.Generator().manual_seed(rows + 11)
+    logits, seq_lens, _, _, _ = _make_varlen_case(
+        _mixed_kv(batch, top_k, next_n, cr, width, gen),
+        next_n,
+        cr,
+        top_k,
+        seed=rows,
+        msl_c=width,
+    )
+    kw = {}
+    if paged:
+        kw = dict(
+            page_table=_random_page_table(batch, width, 64, seed=rows + 1), page_size=64
+        )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    ref = torch.full_like(out, -7)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        # compile + this stream's workspace slab, outside capture
+        _run_host(logits, seq_lens, top_k, next_n, cr, out, True, **kw)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_host(logits, seq_lens, top_k, next_n, cr, out, True, **kw)
+    torch.cuda.synchronize()
+    _assert_family(
+        rows,
+        width,
+        top_k,
+        next_n,
+        cr,
+        family,
+        hint_free=True,
+        page_shift=6 if paged else None,
+        early_len=True,
+    )
+
+    hi = width * cr
+
+    def rnd(lo, m):
+        return [int(v) for v in torch.randint(lo, hi + 1, (m,), generator=gen)]
+
+    steps = [
+        _short_kv(batch, top_k, next_n, cr, gen),  # every row at most top_k columns
+        rnd(top_k * cr + cr + next_n, batch),  # every row longer than top_k
+        [0] * batch,  # every row empty
+        _mixed_kv(batch, top_k, next_n, cr, width, gen),  # every length class
+        _short_kv(batch, top_k, next_n, cr, gen),  # short after long rows
+    ]
+    gdev = torch.Generator(device=_DEV).manual_seed(rows)
+    for kv in steps:
+        seq_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
+        n_r = _row_valid_lens(kv, rows, next_n, cr, width)
+        logits.normal_(generator=gdev)
+        for r, n in enumerate(n_r):
+            logits[r, n:] = 3e38  # poison past each row
+        out.fill_(-7)
+        g.replay()
+        ref.fill_(-7)
+        _run_host(logits, seq_lens, top_k, next_n, cr, ref, False, **kw)
+        torch.cuda.synchronize()
+        assert torch.equal(_sorted_rows(out), _sorted_rows(ref))
+        if not paged:
+            _check_varlen_rows(logits, out, n_r, top_k)
+
+
+_PRODUCER = {}
+
+
+def _pdl_producer():
+    """A one-CTA CuTe DSL kernel that lets the next kernel on the stream launch
+    at once (griddepcontrol.launch_dependents), spins for ``spin`` steps, then
+    copies ``out`` into ``saved`` and ``src`` into ``dst`` ([rows, cols]
+    tensors). Placed right before a PDL launch, it keeps that launch's CTAs
+    resident before their griddepcontrol.wait for the whole spin."""
+    if "fn" not in _PRODUCER:
+        import cutlass
+        import cutlass.cute as cute
+        from cutlass.cute import runtime as crt
+
+        class _Producer:
+            @cute.kernel
+            def kern(
+                self,
+                src: cute.Tensor,
+                dst: cute.Tensor,
+                out: cute.Tensor,
+                saved: cute.Tensor,
+                spin: cutlass.Int32,
+            ):
+                cute.arch.griddepcontrol_launch_dependents()
+                tid, _, _ = cute.arch.thread_idx()
+                acc = cutlass.Int32(0)
+                i = cutlass.Int32(0)
+                while i < spin:
+                    acc = acc * cutlass.Int32(1664525) + cutlass.Int32(1013904223)
+                    i = i + cutlass.Int32(1)
+                r = cutlass.Int32(0)
+                while r < cutlass.Int32(out.shape[0]):
+                    c = tid
+                    while c < cutlass.Int32(out.shape[1]):
+                        saved[r, c] = out[r, c]
+                        c = c + cutlass.Int32(256)
+                    r = r + cutlass.Int32(1)
+                r = cutlass.Int32(0)
+                while r < cutlass.Int32(src.shape[0]):
+                    c = tid
+                    while c < cutlass.Int32(src.shape[1]):
+                        dst[r, c] = src[r, c]
+                        c = c + cutlass.Int32(256)
+                    r = r + cutlass.Int32(1)
+                if acc == cutlass.Int32(
+                    7
+                ):  # keeps the spin (never 7 after 200000 steps)
+                    saved[0, 0] = acc
+
+            @cute.jit
+            def __call__(self, src, dst, out, saved, spin: cutlass.Int32, stream):
+                self.kern(src, dst, out, saved, spin).launch(
+                    grid=(1, 1, 1), block=(256, 1, 1), stream=stream
+                )
+
+        def fake(dt):
+            return crt.make_fake_compact_tensor(
+                dt,
+                (cute.sym_int(), cute.sym_int()),
+                stride_order=(1, 0),
+                assumed_align=4,
+            )
+
+        _PRODUCER["fn"] = cute.compile(
+            _Producer(),
+            fake(cutlass.Float32),
+            fake(cutlass.Float32),
+            fake(cutlass.Int32),
+            fake(cutlass.Int32),
+            cutlass.Int32(0),
+            stream=crt.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    return _PRODUCER["fn"]
+
+
+@requires_gvr2
+@pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
+@pytest.mark.parametrize(
+    "rows,width,top_k,next_n,cr,family",
+    [_SHORT_SHAPES[i] for i in (0, 2, 4, 6, 8, 10)],
+    ids=["reg", "regclus", "clus", "split", "cta1024", "cta512"],
+)
+def test_gvr2_kv_lens_before_pdl_wait_pdl_chain(
+    rows, width, top_k, next_n, cr, family, paged
+):
+    """The flag under real PDL overlap: a producer kernel right before the top-k
+    on the stream lets it launch at once, spins, then reads the top-k's output
+    buffer and writes the scores the top-k ranks. seq_lens are written before
+    the producer starts (the flag's contract). The top-k reads its lengths
+    early but must still read the scores only after the producer finished
+    (exact output) and write nothing before that (the producer's copy of the
+    output buffer stays all poison); eagerly and in a captured graph replayed
+    with rewritten lengths and scores."""
+    batch = rows // next_n
+    gen = torch.Generator().manual_seed(rows + 23)
+    live = min(width, 8 * top_k)  # columns the producer writes (cheap copies)
+    stale, seq_lens, _, _, _ = _make_varlen_case(
+        _mixed_kv(batch, top_k, next_n, cr, live, gen),
+        next_n,
+        cr,
+        top_k,
+        seed=rows,
+        msl_c=width,
+    )
+    logits = stale.clone()
+    kw = {}
+    if paged:
+        kw = dict(
+            page_table=_random_page_table(batch, width, 64, seed=rows + 2), page_size=64
+        )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    saved = torch.empty_like(out)
+    ref = torch.empty_like(out)
+    produce = _pdl_producer()
+    gdev = torch.Generator(device=_DEV).manual_seed(rows + 5)
+
+    def problem(kv):
+        """Fresh scores (written by the producer) for lengths kv; the top-k
+        buffer starts from stale scores and a poisoned output."""
+        seq_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
+        n_r = _row_valid_lens(kv, rows, next_n, cr, width)
+        fresh = torch.randn(rows, live, generator=gdev, device=_DEV) - 2.0
+        for r, n in enumerate(n_r):
+            fresh[r, n:] = 3e38  # poison past each row
+        logits.copy_(stale)
+        out.fill_(-7)
+        saved.fill_(0)
+        return fresh, n_r
+
+    def chain(fresh):
+        produce(fresh, logits, out, saved, 200000)  # fills logits[:, :live]
+        _run_host(logits, seq_lens, top_k, next_n, cr, out, True, **kw)
+
+    def check(fresh, n_r):
+        torch.cuda.synchronize()
+        assert bool((saved == -7).all()), "output written before the PDL wait"
+        full = stale.clone()
+        full[:, :live] = fresh
+        ref.fill_(-7)
+        _run_host(full, seq_lens, top_k, next_n, cr, ref, False, **kw)
+        torch.cuda.synchronize()
+        assert torch.equal(_sorted_rows(out), _sorted_rows(ref)), "scores read early"
+        if not paged:
+            _check_varlen_rows(full, out, n_r, top_k)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        _run_host(logits, seq_lens, top_k, next_n, cr, out, True, **kw)  # compile
+    torch.cuda.synchronize()
+    for _ in range(2):  # eager
+        fresh, n_r = problem(_mixed_kv(batch, top_k, next_n, cr, live, gen))
+        with torch.cuda.stream(s):
+            chain(fresh)
+        check(fresh, n_r)
+    fresh, n_r = problem(_mixed_kv(batch, top_k, next_n, cr, live, gen))
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        chain(fresh)
+    torch.cuda.synchronize()
+    _assert_family(
+        rows,
+        width,
+        top_k,
+        next_n,
+        cr,
+        family,
+        hint_free=True,
+        page_shift=6 if paged else None,
+        early_len=True,
+    )
+    for kv in (
+        _mixed_kv(batch, top_k, next_n, cr, live, gen),
+        _short_kv(batch, top_k, next_n, cr, gen),
+    ):
+        new, n_r = problem(kv)
+        fresh.copy_(new)
+        g.replay()
+        check(fresh, n_r)
 
 
 # ---------------------------------------------------------------------------
