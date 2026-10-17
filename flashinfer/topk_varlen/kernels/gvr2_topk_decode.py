@@ -2076,26 +2076,21 @@ class GvrMainKernel:
                         else:
                             s_ofs[0] = cutlass.Int32(0) - lead
             # Register-free L2 hints for the first U-batch of this CTA's own
-            # P3 slice (clamped in-row): the data P3 touches first starts
-            # flowing while warp0 walks the chain. Short rows clamp every
-            # hint to the row's last line — harmless.
-            # prefill: the base is shifted to col0, so clamp within the row's own
-            # window [col0, ke) — n4-1 is the last full in-window float4.
-            if cutlass.const_expr(self.prefill):
-                plim4 = n4 - cutlass.Int32(1)
-                if plim4 < cutlass.Int32(0):
-                    plim4 = cutlass.Int32(0)
-            else:
-                plim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
+            # P3 slice: the data P3 touches first starts flowing while warp0
+            # walks the chain. Lanes past the slice issue no hint. Clamping
+            # them to the row's last line instead sent U hints per warp, from
+            # every CTA of the row, to that one line; on B200 such a flood
+            # stalls unrelated loads by an amount that depends on the line's
+            # physical address (short SPLIT rows: up to 1.4x, varying with
+            # where the logits buffer sits).
             for uu in cutlass.range_constexpr(U):
                 # NOTE: names must not collide with the PRIME-LATE block's
                 # i_/ic — the DSL kills inner-scope names at region exit and
                 # a later same-name assignment inside a dynamic `if` trips
                 # "is None prior to this if".
                 pic = c0 + tidx + cutlass.Int32(uu * BLK)
-                if pic >= c1:
-                    pic = plim4
-                C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
+                if pic < c1:
+                    C._prefetch_l2(x_addr + cutlass.Int64(pic) * cutlass.Int64(16))
             cute.arch.barrier()  # publish s_lad (also covers the smem inits)
             SMP = s_lad[0]
             SS2 = s_lad[1]
@@ -2161,13 +2156,12 @@ class GvrMainKernel:
             cute.arch.barrier()  # ---- barrier (sample redux publish) ----
 
             # PRIME-LATE prefetch block: strictly after the barrier.
-            # prefill clamps to the last in-window float4 (see plim4 note above).
-            if cutlass.const_expr(self.prefill):
-                lim4 = n4 - cutlass.Int32(1)
-                if lim4 < cutlass.Int32(0):
-                    lim4 = cutlass.Int32(0)
-            else:
-                lim4 = (npad >> cutlass.Int32(2)) - cutlass.Int32(1)
+            # Lanes past the slice clamp their loads to its end (c1 - 1, live
+            # data read anyway; prefill: the last in-window float4), not to a
+            # line outside the row (see the L2 hint note above).
+            lim4 = c1 - cutlass.Int32(1)
+            if lim4 < cutlass.Int32(0):
+                lim4 = cutlass.Int32(0)
             pf = [cute.make_rmem_tensor((4,), cutlass.Float32) for _ in range(max(PFD, 1))]
             if cutlass.const_expr(self.pf):
                 fullsl = cutlass.Int32(0)
@@ -2205,13 +2199,11 @@ class GvrMainKernel:
                             + cutlass.Int64(c0 + tidx + cutlass.Int32(uu * BLK)) * cutlass.Int64(16)
                         )
                 else:
-                    if SMP > cutlass.Int32(0):  # prefetch site #3
+                    if SMP > cutlass.Int32(0):  # prefetch site #3 (in-slice lanes only)
                         for uu in cutlass.range_constexpr(U):
                             i_ = c0 + tidx + cutlass.Int32(uu * BLK)
-                            ic = i_
-                            if ic >= c1:
-                                ic = lim4
-                            C._prefetch_l2(x_addr + cutlass.Int64(ic) * cutlass.Int64(16))
+                            if i_ < c1:
+                                C._prefetch_l2(x_addr + cutlass.Int64(i_) * cutlass.Int64(16))
 
             # cross-warp sample reduce
             av = cutlass.Uint32(0xFFFFFFFF)
