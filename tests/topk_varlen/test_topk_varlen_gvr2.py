@@ -1419,7 +1419,7 @@ _SAMPLE_GATE_CASES = [
     (148, 130944, 512, 16384, None),  # one-wave 1024-thread slab
     (75, 65540, 512, 16384, None),  # the same slab: first rows / first width
     (149, 65472, 512, 4096, None),  # two-CTA (512, U 8, MINB 2) slab
-    (296, 65472, 1024, 4096, None),  # the same at K = 1024 (aim 1.375k)
+    (296, 65472, 1024, 4096, None),  # the same at K = 1024 (aim 7k/4)
     (297, 32768, 1024, 4096, None),  # (256, U 8, MINB 4) slab
     (148, 130944, 512, 16384, 128),  # paged: V4.1 page size
     (296, 65472, 1024, 4096, 64),  # paged: DSv4 page size
@@ -3133,8 +3133,8 @@ def test_gvr2_small_row_sample_gate():
         (128, 131072, 512, 1024, 0),  # one-wave slab, K=512 (aim 2k)
         (128, 131072, 1024, 4096, 0),  # one-wave slab, K=1024 (aim 4k)
         (64, 131072, 2048, 8192, 0),  # one-wave slab, K=2048 (aim 4k)
-        (160, 131072, 512, 768, 0),  # two-CTA slab (aim 1.5k: floored at 2k)
-        (160, 131072, 2048, 2816, 1),  # two-CTA slab, K > 1024 (upstream)
+        (160, 131072, 512, 896, 0),  # two-CTA slab (aim 7k/4: floored at 2k)
+        (160, 131072, 2048, 3584, 1),  # two-CTA slab, K > 1024 (aim 7k/4)
         (4, 262144, 512, 0, 0),  # SPLIT slab: off (register path)
         (4, 262144, 2048, 0, 0),  # SPLIT slab, K > 1024: off (register path)
     ],

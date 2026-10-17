@@ -1146,10 +1146,19 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         )
     )
     big = _big_regime(num_rows, r_const, n_route >> 2)
+    # FlashInfer-local: the one-CTA slabs off the big regime (512- and 256-thread
+    # CTAs, R == 1) aim at 7k/4 (upstream: 11k/8 at K >= 1024, 3k/2 below). The
+    # first threshold is the sample's rank-TGT rung, which keeps about `aim`
+    # values; the sample reads runs of 8 adjacent values, so on real rows, whose
+    # top scores come in runs, its estimate is coarse, and at 1.375-1.5k the rung
+    # kept fewer than k values on 28 of 441 captured DSv4 / V3.2 decode rows of
+    # 8K-262K columns (up to 21% of one layer's rows). Such a row streams a
+    # second time and the one-wave batch waits for it. At 7k/4 none misses and
+    # the staged count stays under 0.6 SCAP.
     aim_base = (
         ((4 * k if k >= 1024 else 2 * k) if r_const == 1 else 2 * k)
         if big
-        else ((11 * k) // 8 if k >= 1024 else (3 * k) // 2)
+        else (7 * k) // 4
     )
     sfac = (
         (32 if r_const == 2 else (48 if k > 1024 else 16))
