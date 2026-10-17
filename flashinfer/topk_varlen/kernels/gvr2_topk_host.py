@@ -1206,8 +1206,8 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         _VARLEN_CACHE[key] = lc
         return lc
     tpl, r_const, clus, rt = _main_engine(num_rows, n_route, npad, k, paged)
-    # TSHG (tpl[6]) is dead under varlen (the ctor compiles the TSH
-    # machinery in whenever SPLIT); normalize it out of the compile key so
+    # TSHG (tpl[6]) is dead under varlen (the ctor never compiles the TSH
+    # floor into a varlen engine); normalize it out of the compile key so
     # row counts differing only in that slot share one engine
     fn = _gate_first_call(
         dev.get_compiled(

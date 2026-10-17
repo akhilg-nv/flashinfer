@@ -3722,8 +3722,8 @@ def get_compiled(
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
-    — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
-    machinery in whenever SPLIT and gates it per row at runtime).
+    — per-row varlen mode (TSHG slot is ignored: varlen engines never compile
+    the TSH floor; the rows it would guard sample 4x denser instead).
     ``hint_free`` compiles the hint-gather sites out (part of the key).
 
     ``prefill`` selects the per-row [ks, ke) window mode (TRT-LLM #18702). It
