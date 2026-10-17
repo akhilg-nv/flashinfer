@@ -1078,14 +1078,16 @@ def _run_hard(logits, kv, top_k, n_r, want, next_n=1, cr=1, page_size=None, **kw
 
 
 _SAMPLE_GATE_CASES = [
-    # rows, width, top_k, SCAP of the slab the width launches, page size
-    (148, 131072, 512, 16384, None),  # one-wave 1024-thread slab
+    # rows, width, top_k, SCAP of the slab the width launches, page size; widths
+    # below the register-path envelope gate (_MAIN_REG_ENV): from it on, these
+    # rows take the in-kernel register path (test_gvr2_main_register_path_*)
+    (148, 130944, 512, 16384, None),  # one-wave 1024-thread slab
     (75, 65540, 512, 16384, None),  # the same slab: first rows / first width
-    (149, 65536, 512, 4096, None),  # two-CTA (512, U 8, MINB 2) slab
-    (296, 65536, 1024, 4096, None),  # the same at K = 1024 (aim 1.375k)
+    (149, 65472, 512, 4096, None),  # two-CTA (512, U 8, MINB 2) slab
+    (296, 65472, 1024, 4096, None),  # the same at K = 1024 (aim 1.375k)
     (297, 32768, 1024, 4096, None),  # (256, U 8, MINB 4) slab
-    (148, 131072, 512, 16384, 128),  # paged: V4.1 page size
-    (296, 65536, 1024, 4096, 64),  # paged: DSv4 page size
+    (148, 130944, 512, 16384, 128),  # paged: V4.1 page size
+    (296, 65472, 1024, 4096, 64),  # paged: DSv4 page size
     (297, 32768, 1024, 4096, 1),  # paged: one token per page
 ]
 
@@ -1097,6 +1099,7 @@ _SAMPLE_GATE_CASES = [
 def test_gvr2_small_row_sample_hard_rows(rows, width, top_k, scap, page_size, pattern):
     """Hint-free rows on both edges of the small-row sample (2k < n <= SCAP)
     and of SCAP itself on every one-CTA-per-row slab that samples them."""
+    assert _main_reg_cap(rows, width, top_k) == 0  # streamed, not register rows
     edges = [2 * top_k + d for d in range(-1, 6)] + [scap + d for d in (-1, 0, 1, 3, 4)]
     edges += [top_k, top_k + 1, 1, 0, scap // 2 + 3]
     gen = torch.Generator().manual_seed(rows + width + top_k)
@@ -1118,10 +1121,11 @@ def test_gvr2_small_row_sample_hard_rows(rows, width, top_k, scap, page_size, pa
     "every slot unwritten on the streaming families (main slabs, SPLIT, clus); "
     "the register families handle it (test_gvr2_posinf_completeness).",
 )
-@pytest.mark.parametrize("rows,width", [(148, 131072), (32, 262144)])
+@pytest.mark.parametrize("rows,width", [(148, 130944), (32, 262144)])
 def test_gvr2_streaming_posinf_flood(rows, width):
     """Rows of about 1K-2K columns whose scores are +inf except four, on the
-    one-wave slab (148 rows) and the CS 4 clus split (32 rows)."""
+    one-wave slab (148 rows, below the register-path envelope gate) and the
+    CS 4 clus split (32 rows)."""
     top_k = 512
     gen = torch.Generator(device=_DEV).manual_seed(rows)
     n_r = [[1025, 1026, 1100, 1536, 2049][r % 5] for r in range(rows)]
@@ -1189,8 +1193,9 @@ def test_gvr2_decode_bound_edges(
 
 _REPLAY_BOTH_CASES = [
     # rows, width, top_k, bound, page size, short / long live columns
-    (148, 131072, 512, None, 128, (513, 1024), (1025, 16388)),  # sample gate
-    (296, 65536, 1024, None, 64, (1025, 2048), (2049, 4100)),
+    # (the first two below the register-path envelope gate, _MAIN_REG_ENV)
+    (148, 130944, 512, None, 128, (513, 1024), (1025, 16388)),  # sample gate
+    (296, 65472, 1024, None, 64, (1025, 2048), (2049, 4100)),
     (64, 1048576, 512, 16384, 128, (0, 512), (513, 16384)),  # 16K graph variant
 ]
 
@@ -1259,15 +1264,21 @@ def test_gvr2_graph_replay_both_directions(
 # ---------------------------------------------------------------------------
 
 # (rows, msl_c, top_k, next_n, cr). The decode launch is planned for msl_c (the
-# CUDA-graph capacity) and lands on a SPLIT main engine (1024 threads, R CTAs
-# per row: R = 33 / 16 / 9 / 4 here), while the rows are much shorter. Register
-# rows are <= 16384 columns; rows up to half that take the VPT 2 body.
+# CUDA-graph capacity) and lands on a main engine, while the rows are much
+# shorter: SPLIT (1024 threads, R CTAs per row: R = 33 / 16 / 9 / 4 here) or one
+# CTA per row (1024 threads at 128 and 64 rows, 512 threads at 160 rows).
+# Register rows are <= 16384 columns at 1024 threads and <= 8192 at 512; rows
+# up to half that take the VPT 2 body.
 _MAIN_REG_SHAPES = [
     (1, 131136, 512, 1, 1),
     (9, 131136, 512, 1, 1),
     (9, 131136, 2048, 1, 1),
     (16, 131136, 1024, 2, 4),
     (32, 131136, 2048, 1, 1),  # K = 2048 keeps SPLIT up to 32 rows
+    (128, 131136, 512, 1, 1),
+    (64, 131136, 2048, 1, 1),  # K = 2048: one CTA per row from 33 rows
+    (160, 65600, 1024, 2, 4),
+    (160, 65600, 2048, 1, 1),
 ]
 
 
@@ -1278,16 +1289,21 @@ def _main_reg_cap(rows, msl_c, top_k):
         rows, max(msl_c, top_k + 1), msl_c, top_k, force_main=True
     )
     blk = plan["tpl"][0]
-    return blk * _host._main_reg_vpt(blk, plan["tpl"][5]) * 4
+    return blk * _host._main_reg_vpt(blk, plan["tpl"][5], msl_c) * 4
 
 
-def test_gvr2_main_register_path_split_engines_only():
-    """The register path is compiled into the SPLIT main engines only."""
-    assert _host._main_reg_vpt(1024, True) == 4
-    assert _host._main_reg_vpt(1024, False) == 0
-    assert _host._main_reg_vpt(512, False) == 0
-    assert _host._main_reg_vpt(256, False) == 0
-    assert _main_reg_cap(160, 65600, 512) == 0  # one CTA per row: streams
+def test_gvr2_main_register_path_policy():
+    """The SPLIT main engines always compile the register path in; the
+    one-CTA-per-row engines (1024 and 512 threads) only for an envelope of at
+    least _MAIN_REG_ENV times their register rows; 256 threads never."""
+    env = _host._MAIN_REG_ENV
+    assert _host._main_reg_vpt(1024, True, 0) == 4
+    for blk in (1024, 512):
+        assert _host._main_reg_vpt(blk, False, env * blk * 16) == 4
+        assert _host._main_reg_vpt(blk, False, env * blk * 16 - 1) == 0
+    assert _host._main_reg_vpt(256, False, 1 << 20) == 0
+    assert _main_reg_cap(160, 65600, 512) == 8192
+    assert _main_reg_cap(160, 65472, 512) == 0  # below the envelope gate: streams
 
 
 def _band_lengths(n, top_k, cap, msl_c, gen):
@@ -1316,8 +1332,8 @@ def _band_lengths(n, top_k, cap, msl_c, gen):
 @requires_gvr2
 @pytest.mark.parametrize("rows,msl_c,top_k,next_n,cr", _MAIN_REG_SHAPES)
 def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
-    """Rows far shorter than the launch envelope on the SPLIT main engines,
-    hinted and hint-free: rows that fit the CTA's registers (short and empty rows
+    """Rows far shorter than the launch envelope on the main engines, hinted
+    and hint-free: rows that fit the CTA's registers (short and empty rows
     included) take the in-kernel register path, the others stream. Every row is
     exact, including the band edges (cap, cap + 1) and k + 1."""
     cap = _main_reg_cap(rows, msl_c, top_k)
@@ -1344,14 +1360,16 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
 
 @requires_gvr2
 @pytest.mark.parametrize(
-    "rows,msl_c", [(9, 131136), (16, 131136)], ids=["split9", "split16"]
+    "rows,msl_c",
+    [(9, 131136), (16, 131136), (128, 131136), (160, 65600)],
+    ids=["split9", "split16", "cta1024", "cta512"],
 )
 @pytest.mark.parametrize(
     "pattern", ["constant", "quantized4", "huge_flood_gt_k", "posinf", "neginf_tail"]
 )
 def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern):
     """Tie floods, +inf and an in-window -inf tail inside register-path rows of a
-    SPLIT main launch (the register body's escape and degenerate-bracket arms),
+    main launch (the register body's escape and degenerate-bracket arms),
     hinted and hint-free. Rows of cap - 3 columns put the last column outside
     the float4 batch (n % 4 == 1)."""
     top_k = 1024
@@ -1385,8 +1403,8 @@ def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern):
 @requires_gvr2
 @pytest.mark.parametrize(
     "rows,msl_c,top_k",
-    [(9, 131136, 512), (32, 131136, 2048)],
-    ids=["split9", "split32"],
+    [(9, 131136, 512), (32, 131136, 2048), (128, 131136, 512), (160, 65600, 2048)],
+    ids=["split9", "split32", "cta1024", "cta512"],
 )
 @pytest.mark.parametrize("paged", [False, True], ids=["unpaged", "paged64"])
 def test_gvr2_main_register_path_graph_replay(rows, msl_c, top_k, paged):
@@ -1846,11 +1864,15 @@ _INF_SHAPES = [
     pytest.param(16, 32832, 32773, 2048, id="reg_clus_cs4"),
     pytest.param(32, 131072, 32773, 1024, id="clus_cs4"),
     # main at the v41block serving width (SPLIT), big, and 512-thread slabs; the
-    # SPLIT engines rank rows of up to 16384 columns with the register body
+    # SPLIT engines rank rows of up to 16384 columns with the register body, and
+    # so do the one-CTA engines from an envelope of _MAIN_REG_ENV register rows
+    # (main_big_reg; main_b512: 512 threads, rows of up to 8192 columns)
     pytest.param(1, 131104, 4101, 2048, id="main_split"),
     pytest.param(1, 131104, 32773, 2048, id="main_split_stream"),
     pytest.param(64, 131072, 32773, 2048, id="main_big"),
+    pytest.param(64, 131104, 4101, 2048, id="main_big_reg"),
     pytest.param(160, 131072, 4101, 2048, id="main_b512"),
+    pytest.param(160, 65472, 4101, 2048, id="main_b512_stream"),
 ]
 
 _INF_PATTERNS = [
@@ -2692,8 +2714,10 @@ def test_gvr2_launcher_small_row_sample(
 @pytest.mark.parametrize(
     "rows,cap_c,top_k",
     [
-        (128, 131072, 1024),  # one-wave slab: threshold aim = 4096
-        (64, 131072, 2048),  # one-wave slab, K=2048: threshold aim = 8192
+        # below the register-path envelope gate (_MAIN_REG_ENV), which would
+        # rank all of these rows with the register body
+        (128, 130944, 1024),  # one-wave slab: threshold aim = 4096
+        (64, 130944, 2048),  # one-wave slab, K=2048: threshold aim = 8192
     ],
 )
 def test_gvr2_small_row_sample_threshold_edges(rows, cap_c, top_k):
@@ -2703,6 +2727,7 @@ def test_gvr2_small_row_sample_threshold_edges(rows, cap_c, top_k):
     lc = _host._varlen_launcher(rows, cap_c, top_k, cap_c, 1, 1, True, None)
     thr = lc[3][3]
     assert 2 * top_k < thr < 16384, lc[3]
+    assert _main_reg_cap(rows, cap_c, top_k) == 0  # streamed, not register rows
     edges = [thr, thr + 1, thr - 1, thr + 4, 2 * top_k + 1, 8192, 8196]
     cols = [edges[r % len(edges)] for r in range(rows)]
     logits, seq_lens, _, n_r, _ = _make_varlen_case(
