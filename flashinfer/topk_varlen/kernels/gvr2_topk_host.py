@@ -1178,8 +1178,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     # the envelope (U = 8 at every serving capacity), so a live row of <= one
     # BLK * U chunk (32K columns) already ran on rank 0 alone; it now skips
     # the cluster protocol as well. Measured B200, DSv4 Flash rows at 262,208
-    # columns, 32 / 64 rows: 12-19% faster on 1K-32K-column rows, longer rows
-    # within +-0.6%.
+    # columns, 32 / 64 rows: 12-19% faster on 1K-32K-column rows. A
+    # same-process A/B on the four K <= 1024 model shapes measured longer
+    # rows 0.1-1.7% slower at CS = 2 and at most 0.3% slower at CS = 4.
     if plan_free["kernel"] == "clus":
         rt_f = plan_free["rt"]
         fn = _gate_first_call(

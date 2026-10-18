@@ -1570,9 +1570,9 @@ def test_gvr2_clus_solo_hard_rows(rows, width, top_k, next_n, page_size, pattern
 _SPLIT_DENSE_CASES = [
     # rows, width, top_k, page size: SPLIT launches (K <= 1024 rows of up to 131,075
     # columns, n4 <= 32768, take the 4x denser sample; longer rows the plain one)
-    (1, 1048576, 512, None),  # R 148
-    (4, 262144, 1024, None),  # R 37
-    (16, 524288, 512, None),  # R 9
+    (1, 1048576, 512, None),  # R 120 (B200: clusters of 8)
+    (4, 262144, 1024, None),  # R 32 (clusters of 4)
+    (16, 524288, 512, None),  # R 8 (clusters of 4)
     (8, 1048576, 512, 128),  # paged: V4.1 page size
     (4, 262144, 1024, 64),  # paged: DSv4 page size
 ]
@@ -1710,7 +1710,7 @@ _MISS_CASES = [
     (160, 163840, 2048, "main", None),
     (300, 131072, 1024, "main", None),  # one CTA per row, 256 threads
     (128, 262144, 1024, "main", None),  # one CTA per row, 1024 threads
-    (4, 262144, 512, "main", None),  # SPLIT, R 37: dense-sample rows and plain ones
+    (4, 262144, 512, "main", None),  # SPLIT, R 32: dense-sample rows and plain ones
     (32, 262144, 512, "clus", None),  # CS 4: solo and multi-chunk rows
     (64, 262144, 1024, "clus", None),  # CS 2
     (32, 262144, 1024, "clus", 64),  # paged
@@ -1980,8 +1980,8 @@ def test_gvr2_main_register_path_narrow_rows(rows, msl_c, top_k, next_n, cr):
     """Short register rows (top_k < n <= 2048, the VPT 2 body) and the VPT 2 /
     VPT 4 edge of the SPLIT engines (BLK * 8 = 8192 columns: 8191, 8192, 8193),
     hinted and hint-free, next to short and streaming rows of the same SPLIT
-    launch: k, k + 1 and every n % 4 above it, 2045-2049, 3k, an empty row and
-    a streaming row."""
+    launch: k, k + 1 and every n % 4 above it, 2045 and 2047-2049, 3k, an empty
+    row and a streaming row."""
     vpt2 = _main_reg_cap(rows, msl_c, top_k) // 2  # the VPT 2 body's rows: 8192
     edges = [top_k, top_k + 1, top_k + 2, top_k + 3, top_k + 4, _NAR_CAP - 3]
     edges += [_NAR_CAP - 1, _NAR_CAP, _NAR_CAP + 1, 3 * top_k, 0, msl_c - 5]
@@ -2134,7 +2134,7 @@ def test_gvr2_main_register_path_graph_replay(rows, msl_c, top_k, paged):
 
 # (rows, width, top_k, row lengths, family): launches whose rows all run one
 # register body: the 1024-thread VPT 4 body of the SPLIT and one-CTA main engines,
-# the SPLIT engines' 512-thread rung, and the register kernel at 512 threads with
+# the SPLIT engines' VPT 2 body, and the register kernel at 512 threads with
 # VPT 1 and VPT 4. Each length leaves 1-3 columns past the float4 batch (the tail
 # element of threads 0-2).
 _TAIL_CASES = [

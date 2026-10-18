@@ -47,14 +47,13 @@ the envelope in launch slot ``n`` instead of the row stride, the clus
 family's solo rows (``GvrClusKernel`` ``solo``), the in-kernel register
 paths of the main and clus families (``GvrMainKernel`` / ``GvrClusKernel``
 ``reg_vpt``, which call ``GvrTopkRegKernel.row_topk``, the register kernel
-body split out of ``kern``), the
-decode rows of n <= k columns, whose output one CTA writes right after the
-length read while the row's other CTAs leave (``_short_row_out``), and the
-main family's cluster register path (``GvrMainKernel`` ``clus_cs``, which
-calls ``GvrRegClusKernel.row_topk``, the clustered register kernel body split
-out of ``kern``, with ``embedded``: a finite-only bracket whose top also
-covers runs spread over the row).  Keep
-future diffs against upstream mechanical.
+body split out of ``kern``), the decode rows of n <= k columns, whose output
+one CTA writes right after the length read while the row's other CTAs leave
+(``_short_row_out``), and the main family's cluster register path
+(``GvrMainKernel`` ``clus_cs``, which calls ``GvrRegClusKernel.row_topk``,
+the clustered register kernel body split out of ``kern``, with
+``embedded``: a finite-only bracket whose top also covers runs spread over
+the row).  Keep future diffs against upstream mechanical.
 """
 
 import contextlib
