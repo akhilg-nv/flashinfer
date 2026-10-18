@@ -1282,8 +1282,8 @@ def test_gvr2_decode_bound_validation():
 # degenerate paths (tie floods, +inf floods and +inf in the sampled head,
 # whole -inf rows and rows with fewer than top_k finite scores, denormals,
 # ramps); paged output is mapped back through its injective page table and
-# checked like the unpaged output. More +inf than top_k is a known gap of the
-# streaming families, pinned separately (test_gvr2_streaming_posinf_flood).
+# checked like the unpaged output. Floods of more +inf than top_k are covered
+# separately (test_gvr2_streaming_flood*).
 # The two runs patterns put the top scores in runs of 16 adjacent columns, the
 # granularity the streaming samples read (8- and 16-value groups), so a few
 # groups can land on runs and set a sample rung above the k-th score.
@@ -1475,33 +1475,64 @@ def test_gvr2_small_row_sample_hard_rows(rows, width, top_k, scap, page_size, pa
     _run_hard(logits, n_r, top_k, n_r, "main", page_size=page_size)
 
 
+# Streaming rows whose crossing refine narrows a flood in key space: more than
+# top_k copies of +inf, or of a finite score above 2^127, next to a few finite
+# scores. The bracket is then infinite (+inf in it) or overflows (the sentinel
+# bracket that replaces a collapsed one), so the candidates share one bin and the
+# refine's key-space narrowing ranks the staged set from its least key. The bin
+# holding the flood's keys could end past 0xFFFFFFFF; the wrapped upper bound
+# stopped the descent below them and the row came back with every slot unwritten.
 @requires_gvr2
-@pytest.mark.xfail(
-    strict=False,
-    reason="pre-existing (gvr_2 at 60039395e, unchanged by the capacity changes): "
-    "a row holding more +inf than top_k, but not only +inf, can come back with "
-    "every slot unwritten on the streaming families (main slabs, SPLIT, clus); "
-    "the register families handle it (test_gvr2_posinf_completeness).",
+@pytest.mark.parametrize("value", [float("inf"), 3.1e38], ids=["posinf", "huge"])
+@pytest.mark.parametrize(
+    "rows,width,top_k",
+    [(148, 130944, 512), (160, 65472, 512), (75, 65540, 1024), (64, 65536, 2048)],
+    ids=["onewave512", "cta512", "onewave1024", "onewave2048"],
 )
-@pytest.mark.parametrize("rows,width", [(148, 130944), (32, 262144)])
-def test_gvr2_streaming_posinf_flood(rows, width):
-    """Rows of about 1K-2K columns whose scores are +inf except four, on the
-    one-wave slab (148 rows, below the register-path envelope gate) and the
-    CS 4 clus split (32 rows)."""
-    top_k = 512
-    gen = torch.Generator(device=_DEV).manual_seed(rows)
-    n_r = [[1025, 1026, 1100, 1536, 2049][r % 5] for r in range(rows)]
+def test_gvr2_streaming_flood(rows, width, top_k, value):
+    """Rows of k + 2 .. 2k + 1 columns, n - 4 copies of the flood value and four
+    randn scores, on the one-CTA streaming slabs below the register-path gate
+    (1024 threads at K = 512 / 1024 / 2048, 512 threads at K = 512)."""
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    k = top_k
+    lens = [k + 2, 3 * k // 2 + 1, 3 * k // 2 + 7, 2 * k - 1, 2 * k + 1]
+    n_r = [lens[r % len(lens)] for r in range(rows)]
     logits = torch.randn(rows, width, generator=gen, device=_DEV)
     for r, n in enumerate(n_r):
         pos = torch.randperm(n, generator=gen, device=_DEV)[: n - 4]
-        logits[r, pos] = float("inf")
+        logits[r, pos] = value
         logits[r, n:] = 3e38
-    seq_lens = torch.tensor(n_r, dtype=torch.int32, device=_DEV)
-    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
-    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
-    torch.cuda.synchronize()
-    assert int((out == -7).sum()) == 0, "unwritten output slots"
-    _check_varlen_rows(logits, out, n_r, top_k)
+    _run_hard(logits, n_r, top_k, n_r, "main")
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,width,top_k,lens,family",
+    [
+        (4, 262144, 512, (140001, 150002, 200003, 262143), "main"),
+        (32, 262144, 512, (20001, 40002, 60003, 100003), "clus"),
+        (64, 262144, 1024, (20001, 40002, 60003, 100003), "clus"),
+    ],
+    ids=["split", "clus4", "clus2"],
+)
+def test_gvr2_streaming_flood_neginf_rows(rows, width, top_k, lens, family):
+    """The same refine on streaming rows of the SPLIT and clus engines (longer
+    than their register paths): -inf except the first k columns (k - 4 copies of
+    +inf and four randn scores, so the hint-free bracket is infinite) and k / 4
+    more +inf further out, so the crossing set is the flood and the finite
+    scores."""
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    n_r = [lens[r % len(lens)] for r in range(rows)]
+    logits = torch.full((rows, width), float("-inf"), device=_DEV)
+    for r, n in enumerate(n_r):
+        head = torch.full((top_k,), float("inf"), device=_DEV)
+        fin = torch.randn(4, generator=gen, device=_DEV)
+        head[torch.randperm(top_k, generator=gen, device=_DEV)[:4]] = fin
+        logits[r, :top_k] = head
+        far = torch.randperm(n - top_k, generator=gen, device=_DEV)[: top_k // 4]
+        logits[r, top_k + far] = float("inf")
+        logits[r, n:] = 3e38
+    _run_hard(logits, n_r, top_k, n_r, family)
 
 
 _SOLO_CASES = [
