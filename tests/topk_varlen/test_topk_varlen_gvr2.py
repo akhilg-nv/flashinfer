@@ -1900,8 +1900,9 @@ def _main_reg_cap(rows, msl_c, top_k):
     return blk * _host._main_reg_vpt(blk, plan["tpl"][5], msl_c) * 4
 
 
-# K <= 1024 SPLIT engines rank rows of top_k < n <= 2048 columns on their first
-# 512 threads (the reg family's VPT 1 rung for that band; GvrMainKernel `reg_nar`)
+# short register-path rows: top_k < n <= 2048 columns (1K-2K-column decode rows),
+# which the VPT 2 body ranks like every row of up to BLK * 8 columns (no kernel
+# bound sits at 2048)
 _NAR_CAP = 2048
 
 
@@ -1976,15 +1977,18 @@ def test_gvr2_main_register_path_short_rows(rows, msl_c, top_k, next_n, cr):
     "rows,msl_c,top_k,next_n,cr", [(16, 131136, 512, 1, 1), (8, 131136, 1024, 2, 4)]
 )
 def test_gvr2_main_register_path_narrow_rows(rows, msl_c, top_k, next_n, cr):
-    """The bounds of the 512-thread rung (top_k < n <= 2048), hinted and
-    hint-free, next to short, wider register and streaming rows of the same
-    SPLIT launch: k, k + 1 and every n % 4 above it, the band's last columns,
-    2049, 3k, an empty row and a streaming row."""
+    """Short register rows (top_k < n <= 2048, the VPT 2 body) and the VPT 2 /
+    VPT 4 edge of the SPLIT engines (BLK * 8 = 8192 columns: 8191, 8192, 8193),
+    hinted and hint-free, next to short and streaming rows of the same SPLIT
+    launch: k, k + 1 and every n % 4 above it, 2045-2049, 3k, an empty row and
+    a streaming row."""
+    vpt2 = _main_reg_cap(rows, msl_c, top_k) // 2  # the VPT 2 body's rows: 8192
     edges = [top_k, top_k + 1, top_k + 2, top_k + 3, top_k + 4, _NAR_CAP - 3]
     edges += [_NAR_CAP - 1, _NAR_CAP, _NAR_CAP + 1, 3 * top_k, 0, msl_c - 5]
+    edges += [vpt2 - 1, vpt2, vpt2 + 1]
     reqs = rows // next_n
     gen = torch.Generator().manual_seed(rows + top_k)
-    # every edge, the last launch filled with random rows of the band
+    # every edge, the last launch filled with random short register rows
     fill = torch.randint(top_k + 1, _NAR_CAP + 1, (-len(edges) % reqs,), generator=gen)
     targets = edges + fill.tolist()
     for i in range(0, len(targets), reqs):
@@ -2018,8 +2022,8 @@ def test_gvr2_main_register_path_narrow_rows(rows, msl_c, top_k, next_n, cr):
 def test_gvr2_main_register_path_adversarial(rows, msl_c, pattern, band):
     """Tie floods, +inf and an in-window -inf tail inside register-path rows of a
     main launch (the register body's escape and degenerate-bracket arms),
-    hinted and hint-free, on the VPT 4 body and on rows of the 512-thread
-    rung's band (SPLIT; the one-CTA engines rank those with their VPT 2 body).
+    hinted and hint-free, on the VPT 4 body and on rows of top_k < n <= 2048
+    columns (the VPT 2 body).
     Rows of cap - 3 columns put the last column outside the float4 batch
     (n % 4 == 1)."""
     top_k = 1024 if band == "vpt4" else 512
@@ -2102,11 +2106,11 @@ def test_gvr2_main_register_path_graph_replay(rows, msl_c, top_k, paged):
         rnd(cap + 1, msl_c, rows),  # streaming (the SPLIT slab)
         _band_lengths(rows, top_k, cap, msl_c, gen),  # mixed
         rnd(0, top_k, rows),  # short
-        # the 512-thread rung's band (K < 2048)
+        # short register rows (top_k < n <= 2048 columns; K < 2048)
         rnd(top_k + 1, max(top_k + 1, _NAR_CAP), rows),
         rnd(top_k + 1, cap, rows),  # register again
         rnd(cap + 1, msl_c, rows),  # streaming after a register step
-        rnd(top_k + 1, _NAR_CAP + 1, rows),  # the rung's band and its upper edge
+        rnd(top_k + 1, _NAR_CAP + 1, rows),  # the same rows up to 2049 columns
     ]
     for lens in steps:
         seq_lens.copy_(torch.tensor(lens, dtype=torch.int32, device=_DEV))
@@ -3318,8 +3322,7 @@ _INF_SHAPES = [
     # main at the v41block serving width (SPLIT), big, and 512-thread slabs; the
     # SPLIT engines rank rows of up to 16384 columns with the register body, and
     # so do the one-CTA engines from an envelope of _MAIN_REG_ENV register rows
-    # (main_big_reg; main_b512: 512 threads, rows of up to 8192 columns); with
-    # K <= 1024 SPLIT rows of k < n <= 2048 take the 512-thread rung
+    # (main_big_reg; main_b512: 512 threads, rows of up to 8192 columns)
     pytest.param(1, 131104, 4101, 2048, id="main_split"),
     pytest.param(1, 131104, 32773, 2048, id="main_split_stream"),
     # clustered SPLIT: rows of the cluster band take the clustered register body

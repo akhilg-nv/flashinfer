@@ -47,7 +47,7 @@ the envelope in launch slot ``n`` instead of the row stride, the clus
 family's solo rows (``GvrClusKernel`` ``solo``), the in-kernel register
 paths of the main and clus families (``GvrMainKernel`` / ``GvrClusKernel``
 ``reg_vpt``, which call ``GvrTopkRegKernel.row_topk``, the register kernel
-body split out of ``kern``, also on part of the CTA with ``bar_id``), the
+body split out of ``kern``), the
 decode rows of n <= k columns, whose output one CTA writes right after the
 length read while the row's other CTAs leave (``_short_row_out``), and the
 main family's cluster register path (``GvrMainKernel`` ``clus_cs``, which
@@ -1022,20 +1022,9 @@ def scan_cross(
 # barrier. EXACTLY ONE internal barrier. The second stage is TWO REDUCTIONS,
 # not a scan: tot = redux_add(vv), off = redux_add((lane < wid) ? vv : 0) —
 # wid is warp-uniform so the masked operand stays convergent.
-# bar > 0: the barrier is named barrier `bar` over the blk threads (see
-# GvrTopkRegKernel `bar_id`).
 # ===========================================================================
 @cute.jit
-def scan_cross_w(
-    s_hist,
-    s_ws,
-    target,
-    tidx,
-    s_res,
-    blk: cutlass.Constexpr,
-    nb: cutlass.Constexpr,
-    bar: cutlass.Constexpr = 0,
-):
+def scan_cross_w(s_hist, s_ws, target, tidx, s_res, blk: cutlass.Constexpr, nb: cutlass.Constexpr):
     BPT = nb // blk
     NW = blk // 32
     lane = tidx & cutlass.Int32(31)
@@ -1049,10 +1038,7 @@ def scan_cross_w(
     w = warp_incl_scan_add(sm, lane)
     if lane == cutlass.Int32(31):
         s_ws[wid] = w
-    if cutlass.const_expr(bar):
-        cute.arch.barrier(barrier_id=bar, number_of_threads=blk)
-    else:
-        cute.arch.barrier()  # the ONE internal barrier
+    cute.arch.barrier()  # the ONE internal barrier
     vv = cutlass.Int32(0)
     if lane < cutlass.Int32(NW):
         vv = s_ws[lane]
@@ -1651,22 +1637,13 @@ class GvrMainKernel:
         # that branch as soon as it knows the row's length and then exits, so the
         # smem window can start at the smem base and the streaming body never sees
         # such a row.
-        # On the SPLIT engines with K <= 1024 (KPT 1), rows of k < n <= 2048
-        # columns run on the CTA's first 512 threads instead, with the register
-        # family's 512-thread VPT 1 DEG rung (route()'s rung for 1024 < n <= 2048
-        # at tight capacity; CMP 2048 holds the whole row) and named barrier 1,
-        # while the other warps leave. On such a row the 1024-thread VPT 2 body
-        # costs ~0.7 us (25%) more.
         self.reg_vpt = int(reg_vpt)
         self.regs = []  # (row capacity, embedded body, smem window bytes, CMP), narrowest first
-        self.reg_nar = None  # the 512-thread rung, same tuple
         if self.reg_vpt:
             assert self.varlen and not self.prefill and blk in (512, 1024) and self.reg_vpt in (2, 4)
             # (threads, VPT, MINB, KPT, DEG, NBH, CMP) per rung
             rungs = [(blk, v, minb, kpt, False, 2 * blk, REG_CMP) for v in (2, 4)]
             rungs = rungs[: self.reg_vpt // 2]
-            if kpt == 1 and self.split:
-                rungs.append((512, 1, 4, 1, True, NB__reg, 2048))
             for tb, vpt, mb, kp, deg, nbh, cmp in rungs:
                 cap = tb * vpt * 4
                 # page-table entries a register row can span (the reg family's rule)
@@ -1696,15 +1673,11 @@ class GvrMainKernel:
                     # main serves more rows than SMs
                     stage_out=blk == 1024,
                     embedded=True,
-                    bar_id=1 if tb < blk else 0,
                 )
                 win = STATIC_BYTES + (nbh + 2 * cmp) * 4 + 4 * reg_pt
                 # + k staged outputs (k <= KPT * BLK)
                 assert win + 4 * kpt * blk <= self.dyn_bytes, "register window must fit the smem"
-                if tb < blk:
-                    self.reg_nar = (cap, body, win, cmp)
-                else:
-                    self.regs.append((cap, body, win, cmp))
+                self.regs.append((cap, body, win, cmp))
             self.reg_cap = self.regs[-1][0]
         # Cluster register path (FlashInfer-local, decode SPLIT engines with the
         # register path). With clus_cs > 0 the launch groups each row's parts into
@@ -1851,35 +1824,18 @@ class GvrMainKernel:
         SPLIT row ranks it; the other parts never touch the slab, so the row
         owes no arrivals and its g_off / g_don stay zero."""
         if part == cutlass.Int32(0):
-            # k < n <= 2048: the 512-thread rung (decode rows of n <= k left at
-            # the kernel top before reaching here)
-            nar = cutlass.Int32(0)
-            if cutlass.const_expr(self.reg_nar is not None):
-                if n_row > k:
-                    if n_row <= cutlass.Int32(self.reg_nar[0]):
-                        nar = cutlass.Int32(1)
-            # (the 512-thread rung's code goes last: placed first, it made ptxas
-            # spill in the other rungs and the streaming body of the unpaged engines)
-            if nar == cutlass.Int32(0):
-                if cutlass.const_expr(len(self.regs) == 1):
+            if cutlass.const_expr(len(self.regs) == 1):
+                self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+            else:
+                if n_row <= cutlass.Int32(self.regs[0][0]):
                     self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
                 else:
-                    if n_row <= cutlass.Int32(self.regs[0][0]):
-                        self._reg_rank(0, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
-                    else:
-                        self._reg_rank(1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
-            else:
-                if cutlass.const_expr(self.reg_nar is not None):
-                    # the first 512 threads rank it; the others go straight to
-                    # the exit, never reaching its named barrier
-                    tid, _, _ = cute.arch.thread_idx()
-                    if tid < cutlass.Int32(self.reg_nar[1].blk):
-                        self._reg_rank(-1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
+                    self._reg_rank(1, logits, pre_idx, kv_lens, out, n_row, k, row, sbase)
 
     @cute.jit
     def _reg_rank(self, vi: cutlass.Constexpr, logits, pre_idx, kv_lens, out, n_row, k, row, sbase):
-        # vi: index into regs, -1 = the 512-thread rung
-        _, body, win, cmp = self.reg_nar if vi < 0 else self.regs[vi]
+        # vi: index into regs
+        _, body, win, cmp = self.regs[vi]
         smem_bytes = cutlass.Int32(win)
         if cutlass.const_expr(body.stage_out):
             smem_bytes = smem_bytes + k * cutlass.Int32(4)
@@ -4166,7 +4122,6 @@ class GvrTopkRegKernel:
         pt_smem: int = 0,
         stage_out: bool = True,
         embedded: bool = False,
-        bar_id: int = 0,
     ):
         assert blk in (256, 512, 1024) and vpt in (1, 2, 4)
         assert nbh in (256, 512, 1024, 2048)
@@ -4178,11 +4133,6 @@ class GvrTopkRegKernel:
         # rank, row) grid carries the row on block_idx.y.
         self.embedded = bool(embedded)
         assert not (self.embedded and (pdl or prefill))
-        # bar_id > 0 (embedded only): the body runs on the first BLK threads of a
-        # wider CTA whose other threads have left, so every barrier is named
-        # barrier bar_id over BLK threads instead of the CTA-wide bar.sync 0.
-        self.bar_id = int(bar_id)
-        assert self.bar_id == 0 or (self.embedded and 0 < self.bar_id < 16)
         self.blk = blk
         self.vpt = vpt
         self.minb = minb
@@ -4279,11 +4229,8 @@ class GvrTopkRegKernel:
         return self._ox_g(pre_idx, v)
 
     def _sync(self):
-        """The body's CTA barrier (named over BLK threads with ``bar_id``)."""
-        if self.bar_id:
-            cute.arch.barrier(barrier_id=self.bar_id, number_of_threads=self.blk)
-        else:
-            cute.arch.barrier()
+        """The body's CTA barrier."""
+        cute.arch.barrier()
 
     @cute.kernel
     def kern(
@@ -4899,9 +4846,7 @@ class GvrTopkRegKernel:
 
             # ---- crossing-bin find
             if cutlass.const_expr(self.cur or self.nbh > 1024):
-                scan_cross_w(
-                    s_hist, s_ws, k, tid, s_res, blk=self.blk, nb=self.nbh, bar=self.bar_id
-                )
+                scan_cross_w(s_hist, s_ws, k, tid, s_res, blk=self.blk, nb=self.nbh)
             else:
                 find_cross(s_hist, k, tid, s_res, nb=self.nbh)
             self._sync()  # crossing published
@@ -5046,16 +4991,7 @@ class GvrTopkRegKernel:
                                     )
                         self._sync()  # esc level hist
                         if cutlass.const_expr(self.nbh > 1024):
-                            scan_cross_w(
-                                s_hist,
-                                s_ws,
-                                needC,
-                                tid,
-                                s_res,
-                                blk=self.blk,
-                                nb=self.nbh,
-                                bar=self.bar_id,
-                            )
+                            scan_cross_w(s_hist, s_ws, needC, tid, s_res, blk=self.blk, nb=self.nbh)
                         else:
                             find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
                         self._sync()  # esc level scan
@@ -5409,14 +5345,7 @@ class GvrTopkRegKernel:
                                 self._sync()  # level hist
                                 if cutlass.const_expr(self.nbh > 1024):
                                     scan_cross_w(
-                                        s_hist,
-                                        s_ws,
-                                        needC,
-                                        tid,
-                                        s_res,
-                                        blk=self.blk,
-                                        nb=self.nbh,
-                                        bar=self.bar_id,
+                                        s_hist, s_ws, needC, tid, s_res, blk=self.blk, nb=self.nbh
                                     )
                                 else:
                                     find_cross(s_hist, needC, tid, s_res, nb=self.nbh)
