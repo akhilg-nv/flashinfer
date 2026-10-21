@@ -33,14 +33,17 @@ _CTA_K = 128
 #: Kernel-M tiles; 64 increases CTA count for low-M decode shapes.
 _SUPPORTED_MMA_M = (64, 128)
 
-#: Kernel-N carries public M, which is limited to 32.
-_SUPPORTED_MMA_N = (8, 16, 32)
+#: Kernel-N carries public M; 64 covers M = 33..64 with one CTA tile.
+_SUPPORTED_MMA_N = (8, 16, 32, 64)
 
 #: Physical cluster-K sizes; split 1 compiles out the DSMEM path.
 _SUPPORTED_SPLIT_K = (1, 2, 3, 4)
 
-#: Largest public M this low-M policy serves.
-_MAX_M = 32
+#: Largest public M this low-M policy serves. Above 32 it is an autotuner
+#: choice only (``mm_bf16`` defaults to cuBLASLt there): on VR200 it measured
+#: 1.10-1.35x over cuBLAS for N = 1024/2048, K = 6144, M = 33..64, and neutral
+#: or slightly slower on other shapes.
+_MAX_M = 64
 
 #: Bytes per FP32 partial exchanged through DSMEM.
 _FP32_BYTES = 4
@@ -175,6 +178,9 @@ def autotune_tactics(
     tactics: list[SplitKTactic] = []
     for mma_m in _SUPPORTED_MMA_M:
         for mma_n in _SUPPORTED_MMA_N:
+            # The 64-token tile is only for M > 32; it never helps fewer tokens.
+            if mma_n == 64 and m <= 32:
+                continue
             for split_k in _SUPPORTED_SPLIT_K:
                 min_stages = _MIN_AB_STAGES if k == _CTA_K else _DEFAULT_MIN_AB_STAGES
                 base = SplitKTactic(mma_m, mma_n, split_k, min_stages)
@@ -207,7 +213,7 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
         mma_n = 16 if n == 512 and m > 24 else 8
         requested_split = 4
     else:
-        mma_n = 8 if m <= 8 else 16 if m <= 16 else 32
+        mma_n = 8 if m <= 8 else 16 if m <= 16 else 32 if m <= 32 else 64
         if n <= 3072:
             mma_m = 128 if m <= 16 else 64
             requested_split = 4 if m <= 16 else 2

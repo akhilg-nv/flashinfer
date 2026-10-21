@@ -276,5 +276,32 @@ def test_mm_bf16_cute_dsl_one_stage_splitk(enable_bias: bool):
     assert cos_sim > 0.99
 
 
+@pytest.mark.parametrize("m", [33, 48, 64])
+def test_mm_bf16_cute_dsl_splitk_mid_m(m: int):
+    """Cluster Split-K's 64-token tile (M = 33..64, an autotuner-only choice)."""
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("CuTeDSL low-M backend requires SM100/SM103/SM107.")
+
+    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available.")
+    from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
+        default_tactic,
+        run_splitk_dense,
+    )
+
+    n, k = 1024, 6144
+    a = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    bias = torch.randn((n,), device="cuda", dtype=torch.bfloat16)
+    tactic = default_tactic(m, n, k)
+    assert tactic.mma_n == 64
+    out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    run_splitk_dense(a, b.T, bias, out, True, tactic)
+    reference = F.linear(a.float(), b.float(), bias.float()).to(torch.bfloat16)
+    torch.testing.assert_close(out, reference, rtol=2e-2, atol=5e-2)
+
+
 if __name__ == "__main__":
     pytest.main([__file__])
