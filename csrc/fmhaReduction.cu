@@ -547,6 +547,9 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   //   2: 256-thread CTAs, one slice per CTA (E4M3 Q, BF16 O, Q64 tiles only; else stock).
   //   3: 256-thread CTAs, one slice per CTA, sink term hoisted (HoistSink).
   //   4: stock launch shape, sink term hoisted.  5: 512 threads, one slice per CTA, sink term hoisted.
+  //   6: sink hoisted, stock slice count per CTA but no idle CTAs (only ceil(numSlices / slicesPerCta)
+  //      CTAs per tile are launched; stock launches up to 2 x SMs / tiles and leaves the rest empty).
+  //   7 / 8: sink hoisted, 2 / 4 slices per CTA (fewer, longer CTAs).
   //   99: test only, the reverse-split-order mutant (stock launch shape).
   char const* redVariantEnv = std::getenv("FLASHINFER_TRTLLM_GEN_RED_VARIANT");
   int const redVariant = redVariantEnv == nullptr ? 0 : std::atoi(redVariantEnv);
@@ -554,7 +557,7 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
                            kernelMeta.mDataTypeO == DATA_TYPE_BF16 && kernelMeta.mTileSizeQ == 64 &&
                            headDimPerCtaV >= 128;
   bool const useRed256 = (redVariant == 2 || redVariant == 3) && redFastPath;
-  bool const useHoist = (redVariant >= 3 && redVariant <= 5) && redFastPath &&
+  bool const useHoist = (redVariant >= 3 && redVariant <= 8) && redFastPath &&
                         !kernelMeta.mGroupsTokensHeadsQ && (redVariant != 3 || useRed256);
   bool const useMutant = redVariant == 99 && redFastPath;
   if (redVariant == 1 || (redVariant == 5 && useHoist)) {
@@ -562,6 +565,11 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   } else if (useRed256) {
     numCtasForReduction = (headDimPerCtaV * 2 * kernelMeta.mTileSizeQ) / (256 * 16);
     blockDim = dim3(256);
+  } else if (redVariant == 6 && useHoist) {
+    int32_t const slicesPerCta = (numSlices + numCtasForReduction - 1) / numCtasForReduction;
+    numCtasForReduction = (numSlices + slicesPerCta - 1) / slicesPerCta;
+  } else if ((redVariant == 7 || redVariant == 8) && useHoist) {
+    numCtasForReduction = std::max(1, numSlices / (redVariant == 7 ? 2 : 4));
   }
   // Launch more CTAs to split the reduction work if needed.
   gridDim.x *= numCtasForReduction;
