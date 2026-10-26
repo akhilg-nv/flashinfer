@@ -18,6 +18,8 @@
 #include <cuda_runtime_api.h>
 #include <float.h>
 
+#include <cstdlib>
+
 #include "flashinfer/exception.h"
 #include "flashinfer/trtllm/common/cudaTypeUtils.cuh"
 #include "flashinfer/trtllm/common/cudaUtils.h"
@@ -77,9 +79,12 @@ __device__ __forceinline__ int64_t scaleByteOffset(int32_t group, int32_t headIn
 
 }  // namespace dsv4
 
+// [kopt] NumThreads is a template parameter so the RED_VARIANT=2 launch can use smaller CTAs; the
+// per-element arithmetic does not depend on it.
 template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
-          typename DtypePartialO, bool Dsv4OutputEpilogue = false>
-__global__ void __launch_bounds__(NumThreadsPerCta, 2)
+          typename DtypePartialO, bool Dsv4OutputEpilogue = false,
+          int32_t NumThreads = NumThreadsPerCta>
+__global__ void __launch_bounds__(NumThreads, 1024 / NumThreads)
     fmhaReductionKernel(KernelParams const params, bool isTokenSparse, bool groupsTokensHeadsQ,
                         bool supportsVarSparseMlaTopKLens, int32_t numCtasForReduction,
                         int32_t numCtasForAllHeads, int32_t headDimV, int32_t numHeadDimCtasV) {
@@ -203,7 +208,7 @@ __global__ void __launch_bounds__(NumThreadsPerCta, 2)
 
   // The number of processed rows in one slice where each CTA will process one slice.
   int32_t constexpr NumBytesPerHeadDim{HeadDimPerCta * NumBytesPerPartialElt};
-  int32_t constexpr NumBytePerSlice{NumThreadsPerCta * 16};
+  int32_t constexpr NumBytePerSlice{NumThreads * 16};
   static_assert(NumBytePerSlice % NumBytesPerHeadDim == 0, "Not implemented");
   int32_t constexpr NumRowsPerSlice{NumBytePerSlice / NumBytesPerHeadDim};
   // The actual number of tensor slices for the reduction.
@@ -492,7 +497,24 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   int32_t const maxNumCtasForReduction{(multiProcessorCount * 2) /
                                        static_cast<int32_t>(gridDim.x * gridDim.y * gridDim.z)};
   // The number of Ctas for the reduction work.
-  int32_t const numCtasForReduction{std::min(maxNumCtasForReduction, numSlices)};
+  int32_t numCtasForReduction{std::min(maxNumCtasForReduction, numSlices)};
+
+  // [kopt] Default-off launch-shape variants (FLASHINFER_TRTLLM_GEN_RED_VARIANT, read per call).
+  // They change which thread reduces which 16-byte vector, never the per-element arithmetic.
+  //   1: one slice per CTA (512 threads), so no CTA loops over slices.
+  //   2: 256-thread CTAs, one slice per CTA (E4M3 Q, BF16 O, Q64 tiles only; else stock).
+  char const* redVariantEnv = std::getenv("FLASHINFER_TRTLLM_GEN_RED_VARIANT");
+  int const redVariant = redVariantEnv == nullptr ? 0 : std::atoi(redVariantEnv);
+  bool const useRed256 = redVariant == 2 && !dsv4OutputEpilogue &&
+                         kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 &&
+                         kernelMeta.mDataTypeO == DATA_TYPE_BF16 && kernelMeta.mTileSizeQ == 64 &&
+                         headDimPerCtaV >= 128;
+  if (redVariant == 1) {
+    numCtasForReduction = numSlices;
+  } else if (useRed256) {
+    numCtasForReduction = (headDimPerCtaV * 2 * kernelMeta.mTileSizeQ) / (256 * 16);
+    blockDim = dim3(256);
+  }
   // Launch more CTAs to split the reduction work if needed.
   gridDim.x *= numCtasForReduction;
 
@@ -522,6 +544,14 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
       kernel = &fmhaReductionKernel<64, 256, true, __nv_bfloat16, __nv_bfloat16, true>;
     } else {
       kernel = &fmhaReductionKernel<64, 512, true, __nv_bfloat16, __nv_bfloat16, true>;
+    }
+  } else if (useRed256) {
+    if (headDimPerCtaV == 128) {
+      kernel = &fmhaReductionKernel<64, 128, true, __nv_bfloat16, __nv_bfloat16, false, 256>;
+    } else if (headDimPerCtaV == 256) {
+      kernel = &fmhaReductionKernel<64, 256, true, __nv_bfloat16, __nv_bfloat16, false, 256>;
+    } else {
+      kernel = &fmhaReductionKernel<64, 512, true, __nv_bfloat16, __nv_bfloat16, false, 256>;
     }
   } else if (headDimPerCtaV == 64) {
     SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(64);

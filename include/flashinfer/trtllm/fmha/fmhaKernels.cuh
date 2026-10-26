@@ -20,6 +20,8 @@
 
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cuda/std/cfloat>
 #include <iterator>
@@ -81,6 +83,17 @@ class TllmGenFmhaKernel {
  public:
   static constexpr int kDynamicNumTokensPerPageThreshold = 128;
   static constexpr int kDynamicNumTokensPerPageKernelKey = 128;
+
+  // [kopt] Benchmarking knobs for DSv4 sparse MLA decode, all default off and read on every call
+  // so a sweep can change them between CUDA-graph captures:
+  //   FLASHINFER_TRTLLM_GEN_DEBUG_MAX_KV_SPLITS=N  caps the sparse MLA KV split count at N.
+  //   FLASHINFER_TRTLLM_GEN_SPARSE_SPLIT_RULE=21   candidate S21: when the KV length allows 3
+  //       splits but the grid only leaves room for 2 (head dim 512), run 1 split instead.
+  //   FLASHINFER_TRTLLM_GEN_DEBUG_LOG_LAUNCH=1     one stderr line per launch.
+  static int getKoptEnvInt(char const* name) {
+    char const* env = std::getenv(name);
+    return env == nullptr ? 0 : std::atoi(env);
+  }
 
   // The parameters for launching the kernel.
   // maxNumCtasQ, maxNumCtasKv, numCtasX, numCtasY, numCtasZ, clusterDimX
@@ -472,6 +485,33 @@ class TllmGenFmhaKernel {
       }
     }
 
+    // [kopt] Overlay marker (once per process, at the first sparse MLA launch) and the optional
+    // per-launch log; see getKoptEnvInt.
+    if (isSparseMla(params.mSparseMlaType)) {
+      static bool const koptMarker = [] {
+        fprintf(stderr,
+                "[flashinfer-kopt] trtllm-gen fmha_gen overlay active: split_rule=%d "
+                "red_variant=%d max_kv_splits=%d\n",
+                getKoptEnvInt("FLASHINFER_TRTLLM_GEN_SPARSE_SPLIT_RULE"),
+                getKoptEnvInt("FLASHINFER_TRTLLM_GEN_RED_VARIANT"),
+                getKoptEnvInt("FLASHINFER_TRTLLM_GEN_DEBUG_MAX_KV_SPLITS"));
+        return true;
+      }();
+      (void)koptMarker;
+    }
+    if (getKoptEnvInt("FLASHINFER_TRTLLM_GEN_DEBUG_LOG_LAUNCH") > 0) {
+      fprintf(stderr,
+              "[trtllm-gen launch] kernel=%s kvSplits=%d headDimPerCtaV=%d tileSizeQ=%d "
+              "grid=%d,%d,%d separateReduction=%d sms=%d batch=%d maxSeqLenQ=%d headsQ=%d "
+              "sparseTopK=%d pdl=%d\n",
+              kernelMeta.mFuncName, ctaLaunchParams.mMaxNumCtasKv, kernelMeta.mHeadDimPerCtaV,
+              kernelMeta.mTileSizeQ, ctaLaunchParams.mNumCtasX, ctaLaunchParams.mNumCtasY,
+              ctaLaunchParams.mNumCtasZ,
+              static_cast<int>(isGmemReductionWithSeparateKernel(
+                  static_cast<MultiCtasKvMode>(kernelMeta.mMultiCtasKvMode))),
+              params.mMultiProcessorCount, params.mBatchSize, params.mMaxSeqLenQ,
+              params.mNumHeadsQ, params.mSparseMlaTopK, static_cast<int>(params.enable_pdl));
+    }
     cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
     // Run the separate reduction kernel if needed.
@@ -681,6 +721,18 @@ class TllmGenFmhaKernel {
       numCtasPerSeqKv = std::min(
           tunedMaxNumCtasPerSeqKv,
           std::max(1, int32_t(params.mMultiProcessorCount / (numCtasX * numCtasY * numCtasZ))));
+      // [kopt] Default-off knobs (see getKoptEnvInt). Both only lower the split count, so the
+      // grid never exceeds the one-wave partial scratch the stock rule sizes for.
+      if (isSparseMla(params.mSparseMlaType)) {
+        if (int const cap = getKoptEnvInt("FLASHINFER_TRTLLM_GEN_DEBUG_MAX_KV_SPLITS"); cap > 0) {
+          numCtasPerSeqKv = std::min(numCtasPerSeqKv, cap);
+        }
+        if (getKoptEnvInt("FLASHINFER_TRTLLM_GEN_SPARSE_SPLIT_RULE") == 21 &&
+            params.mHeadDimQk == 512 && params.mHeadDimV == 512 && maxNumCtasPerSeqKv == 3 &&
+            numCtasPerSeqKv == 2) {
+          numCtasPerSeqKv = 1;
+        }
+      }
       // Update the numCtasX.
       numCtasX *= numCtasPerSeqKv;
       // The current total number of CTAs.
