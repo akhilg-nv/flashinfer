@@ -89,6 +89,7 @@ class TllmGenFmhaKernel {
   //   FLASHINFER_TRTLLM_GEN_DEBUG_MAX_KV_SPLITS=N  caps the sparse MLA KV split count at N.
   //   FLASHINFER_TRTLLM_GEN_SPARSE_SPLIT_RULE=21   candidate S21: when the KV length allows 3
   //       splits but the grid only leaves room for 2 (head dim 512), run 1 split instead.
+  //       =22 (candidate S22): the same whenever the KV length allows 3 or more splits.
   //   FLASHINFER_TRTLLM_GEN_DEBUG_LOG_LAUNCH=1     one stderr line per launch.
   static int getKoptEnvInt(char const* name) {
     char const* env = std::getenv(name);
@@ -732,9 +733,12 @@ class TllmGenFmhaKernel {
         if (int const cap = getKoptEnvInt("FLASHINFER_TRTLLM_GEN_DEBUG_MAX_KV_SPLITS"); cap > 0) {
           numCtasPerSeqKv = std::min(numCtasPerSeqKv, cap);
         }
-        if (getKoptEnvInt("FLASHINFER_TRTLLM_GEN_SPARSE_SPLIT_RULE") == 21 &&
-            params.mHeadDimQk == 512 && params.mHeadDimV == 512 && maxNumCtasPerSeqKv == 3 &&
-            numCtasPerSeqKv == 2) {
+        // S21: the 640-entry DSv4 tables only (the KV length allows exactly 3 splits).
+        // S22: any table whose KV length allows 3 or more splits (e.g. the wide c128 tables).
+        int const splitRule = getKoptEnvInt("FLASHINFER_TRTLLM_GEN_SPARSE_SPLIT_RULE");
+        if (params.mHeadDimQk == 512 && params.mHeadDimV == 512 && numCtasPerSeqKv == 2 &&
+            ((splitRule == 21 && maxNumCtasPerSeqKv == 3) ||
+             (splitRule == 22 && maxNumCtasPerSeqKv >= 3))) {
           numCtasPerSeqKv = 1;
         }
       }
