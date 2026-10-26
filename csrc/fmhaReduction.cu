@@ -80,10 +80,11 @@ __device__ __forceinline__ int64_t scaleByteOffset(int32_t group, int32_t headIn
 }  // namespace dsv4
 
 // [kopt] NumThreads is a template parameter so the RED_VARIANT=2 launch can use smaller CTAs; the
-// per-element arithmetic does not depend on it.
+// per-element arithmetic does not depend on it. ReverseSplitsMutant (RED_VARIANT=99, test only)
+// combines the KV splits in reverse order: a deliberate arithmetic-order bug the bitwise check must flag.
 template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
           typename DtypePartialO, bool Dsv4OutputEpilogue = false,
-          int32_t NumThreads = NumThreadsPerCta>
+          int32_t NumThreads = NumThreadsPerCta, bool ReverseSplitsMutant = false>
 __global__ void __launch_bounds__(NumThreads, 1024 / NumThreads)
     fmhaReductionKernel(KernelParams const params, bool isTokenSparse, bool groupsTokensHeadsQ,
                         bool supportsVarSparseMlaTopKLens, int32_t numCtasForReduction,
@@ -274,6 +275,9 @@ __global__ void __launch_bounds__(NumThreads, 1024 / NumThreads)
 #pragma unroll
       for (int32_t jj = 0; jj < UnrollSize; ++jj) {
         int32_t ctaIdxKv = min(ii + jj, numCtasKv - 1);
+        if constexpr (ReverseSplitsMutant) {
+          ctaIdxKv = numCtasKv - 1 - ctaIdxKv;
+        }
         partialStatsArray[jj] = localPartialStatsPtr[ctaIdxKv * numRowsInPartialBuffers];
         partialOArray[jj] = *reinterpret_cast<uint4 const*>(
             localPartialOPtr + ctaIdxKv * numRowsInPartialBuffers * HeadDimPerCta);
@@ -503,12 +507,14 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   // They change which thread reduces which 16-byte vector, never the per-element arithmetic.
   //   1: one slice per CTA (512 threads), so no CTA loops over slices.
   //   2: 256-thread CTAs, one slice per CTA (E4M3 Q, BF16 O, Q64 tiles only; else stock).
+  //   99: test only, the reverse-split-order mutant (stock launch shape).
   char const* redVariantEnv = std::getenv("FLASHINFER_TRTLLM_GEN_RED_VARIANT");
   int const redVariant = redVariantEnv == nullptr ? 0 : std::atoi(redVariantEnv);
-  bool const useRed256 = redVariant == 2 && !dsv4OutputEpilogue &&
-                         kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 &&
-                         kernelMeta.mDataTypeO == DATA_TYPE_BF16 && kernelMeta.mTileSizeQ == 64 &&
-                         headDimPerCtaV >= 128;
+  bool const redFastPath = !dsv4OutputEpilogue && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 &&
+                           kernelMeta.mDataTypeO == DATA_TYPE_BF16 && kernelMeta.mTileSizeQ == 64 &&
+                           headDimPerCtaV >= 128;
+  bool const useRed256 = redVariant == 2 && redFastPath;
+  bool const useMutant = redVariant == 99 && redFastPath;
   if (redVariant == 1) {
     numCtasForReduction = numSlices;
   } else if (useRed256) {
@@ -552,6 +558,14 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
       kernel = &fmhaReductionKernel<64, 256, true, __nv_bfloat16, __nv_bfloat16, false, 256>;
     } else {
       kernel = &fmhaReductionKernel<64, 512, true, __nv_bfloat16, __nv_bfloat16, false, 256>;
+    }
+  } else if (useMutant) {
+    if (headDimPerCtaV == 128) {
+      kernel = &fmhaReductionKernel<64, 128, true, __nv_bfloat16, __nv_bfloat16, false, 512, true>;
+    } else if (headDimPerCtaV == 256) {
+      kernel = &fmhaReductionKernel<64, 256, true, __nv_bfloat16, __nv_bfloat16, false, 512, true>;
+    } else {
+      kernel = &fmhaReductionKernel<64, 512, true, __nv_bfloat16, __nv_bfloat16, false, 512, true>;
     }
   } else if (headDimPerCtaV == 64) {
     SELECT_FMHA_REDUCTION_KERNEL_WITH_HEAD_DIM_PER_CTA(64);

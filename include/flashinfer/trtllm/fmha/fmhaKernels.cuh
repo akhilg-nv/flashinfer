@@ -501,16 +501,21 @@ class TllmGenFmhaKernel {
     }
     if (getKoptEnvInt("FLASHINFER_TRTLLM_GEN_DEBUG_LOG_LAUNCH") > 0) {
       fprintf(stderr,
-              "[trtllm-gen launch] kernel=%s kvSplits=%d headDimPerCtaV=%d tileSizeQ=%d "
-              "grid=%d,%d,%d separateReduction=%d sms=%d batch=%d maxSeqLenQ=%d headsQ=%d "
-              "sparseTopK=%d pdl=%d\n",
-              kernelMeta.mFuncName, ctaLaunchParams.mMaxNumCtasKv, kernelMeta.mHeadDimPerCtaV,
-              kernelMeta.mTileSizeQ, ctaLaunchParams.mNumCtasX, ctaLaunchParams.mNumCtasY,
-              ctaLaunchParams.mNumCtasZ,
+              "[trtllm-gen launch] kernel=%s kernelType=%d tileScheduler=%d multiCtasKvMode=%d "
+              "kvSplits=%d headDimPerCtaV=%d tileSizeQ=%d tileSizeKv=%d uses2CtaMma=%d "
+              "grid=%d,%d,%d clusterDimX=%d separateReduction=%d sms=%d batch=%d maxSeqLenQ=%d "
+              "headsQ=%d sparseTopK=%d forcedKvSplits=%d pdl=%d\n",
+              kernelMeta.mFuncName, kernelMeta.mKernelType, kernelMeta.mTileScheduler,
+              kernelMeta.mMultiCtasKvMode, ctaLaunchParams.mMaxNumCtasKv,
+              kernelMeta.mHeadDimPerCtaV, kernelMeta.mTileSizeQ, kernelMeta.mTileSizeKv,
+              static_cast<int>(kernelMeta.m2CtaMma), ctaLaunchParams.mNumCtasX,
+              ctaLaunchParams.mNumCtasY, ctaLaunchParams.mNumCtasZ, ctaLaunchParams.mClusterDimX,
               static_cast<int>(isGmemReductionWithSeparateKernel(
                   static_cast<MultiCtasKvMode>(kernelMeta.mMultiCtasKvMode))),
               params.mMultiProcessorCount, params.mBatchSize, params.mMaxSeqLenQ,
-              params.mNumHeadsQ, params.mSparseMlaTopK, static_cast<int>(params.enable_pdl));
+              params.mNumHeadsQ, params.mSparseMlaTopK,
+              getKoptEnvInt("FLASHINFER_TRTLLM_GEN_DEBUG_MAX_KV_SPLITS"),
+              static_cast<int>(params.enable_pdl));
     }
     cuErrCheck(cuLaunchKernelEx(&launch_config, func, kernelParamsList, nullptr));
 
