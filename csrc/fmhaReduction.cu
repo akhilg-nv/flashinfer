@@ -82,9 +82,14 @@ __device__ __forceinline__ int64_t scaleByteOffset(int32_t group, int32_t headIn
 // [kopt] NumThreads is a template parameter so the RED_VARIANT=2 launch can use smaller CTAs; the
 // per-element arithmetic does not depend on it. ReverseSplitsMutant (RED_VARIANT=99, test only)
 // combines the KV splits in reverse order: a deliberate arithmetic-order bug the bitwise check must flag.
+// HoistSink (RED_VARIANT=3/4/5): the attention-sink term exp2f(sink * M_LOG2E - max * scale) is evaluated in
+// double (M_LOG2E is a double), and FP64 is slow on SM103. Stock evaluates it in every thread of a row; with
+// HoistSink one thread per row evaluates the same expression on the same inputs (the max is recomputed with
+// the same fmaxf sequence) into shared memory, so the result is bit-identical. Not for groupsTokensHeadsQ.
 template <int32_t TileSizePerCtaQ, int32_t HeadDimPerCta, bool IsE4m3Bmm, typename DtypeO,
           typename DtypePartialO, bool Dsv4OutputEpilogue = false,
-          int32_t NumThreads = NumThreadsPerCta, bool ReverseSplitsMutant = false>
+          int32_t NumThreads = NumThreadsPerCta, bool ReverseSplitsMutant = false,
+          bool HoistSink = false>
 __global__ void __launch_bounds__(NumThreads, 1024 / NumThreads)
     fmhaReductionKernel(KernelParams const params, bool isTokenSparse, bool groupsTokensHeadsQ,
                         bool supportsVarSparseMlaTopKLens, int32_t numCtasForReduction,
@@ -225,6 +230,34 @@ __global__ void __launch_bounds__(NumThreads, 1024 / NumThreads)
   // The total number of rows in the partial buffers.
   int32_t numRowsInPartialBuffers{TileSizePerCtaQ};
 
+  // [kopt] HoistSink: the sink term of each row this CTA reduces, one thread per row (see the template note).
+  __shared__ float sinkTermSmem[HoistSink ? TileSizePerCtaQ : 1];
+  if constexpr (HoistSink) {
+    if (attentionSinksPtr != nullptr) {
+      int32_t const firstRowIdx{startSliceIdx * NumRowsPerSlice};
+      int32_t const numRowsThisCta{max(0, (endSliceIdx - startSliceIdx) * NumRowsPerSlice)};
+// Wait for the primary kernel to complete (the partial stats are its output).
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+      cudaGridDependencySynchronize();
+#endif
+      for (int32_t rr = warpGrpThreadIdx; rr < numRowsThisCta; rr += NumThreads) {
+        int32_t const validRowIdx{min(firstRowIdx + rr, numValidRows - 1)};
+        float const* rowStatsPtr = reinterpret_cast<float const*>(partialStatsPtr + validRowIdx);
+        float maxVal{-FLT_MAX};
+        for (int32_t ii = 0; ii < numCtasKv; ii += UnrollSize) {
+#pragma unroll
+          for (int32_t jj = 0; jj < UnrollSize; ++jj) {
+            int32_t const ctaIdxKv = min(ii + jj, numCtasKv - 1);
+            maxVal = fmaxf(maxVal, rowStatsPtr[2 * ctaIdxKv * numRowsInPartialBuffers]);
+          }
+        }
+        sinkTermSmem[rr] =
+            exp2f(attentionSinksPtr[validRowIdx] * M_LOG2E - maxVal * softmaxScaleLog2);
+      }
+    }
+    __syncthreads();
+  }
+
   // Iterate over different slices.
   // Split the reduction work across multiple CtasKv to reduce the latency.
   for (int32_t sliceIdx = startSliceIdx; sliceIdx < endSliceIdx; ++sliceIdx) {
@@ -307,8 +340,13 @@ __global__ void __launch_bounds__(NumThreads, 1024 / NumThreads)
 
     // Update the sums with the attention sink value.
     if (attentionSinksPtr != nullptr) {
-      float attentionSinkVal =
-          exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+      float attentionSinkVal;
+      if constexpr (HoistSink) {
+        attentionSinkVal = sinkTermSmem[rowIdx - startSliceIdx * NumRowsPerSlice];
+      } else {
+        attentionSinkVal =
+            exp2f(attentionSinksPtr[localHeadIdxO] * M_LOG2E - maxVal * softmaxScaleLog2);
+      }
       // Multiply the attention sink value by 448.f if the MMA data type is e4m3 as the sum value
       // has also included the 448.f quantization scale.
       sumVal += IsE4m3Bmm ? attentionSinkVal * 448.f : attentionSinkVal;
@@ -507,15 +545,19 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
   // They change which thread reduces which 16-byte vector, never the per-element arithmetic.
   //   1: one slice per CTA (512 threads), so no CTA loops over slices.
   //   2: 256-thread CTAs, one slice per CTA (E4M3 Q, BF16 O, Q64 tiles only; else stock).
+  //   3: 256-thread CTAs, one slice per CTA, sink term hoisted (HoistSink).
+  //   4: stock launch shape, sink term hoisted.  5: 512 threads, one slice per CTA, sink term hoisted.
   //   99: test only, the reverse-split-order mutant (stock launch shape).
   char const* redVariantEnv = std::getenv("FLASHINFER_TRTLLM_GEN_RED_VARIANT");
   int const redVariant = redVariantEnv == nullptr ? 0 : std::atoi(redVariantEnv);
   bool const redFastPath = !dsv4OutputEpilogue && kernelMeta.mDataTypeQ == DATA_TYPE_E4M3 &&
                            kernelMeta.mDataTypeO == DATA_TYPE_BF16 && kernelMeta.mTileSizeQ == 64 &&
                            headDimPerCtaV >= 128;
-  bool const useRed256 = redVariant == 2 && redFastPath;
+  bool const useRed256 = (redVariant == 2 || redVariant == 3) && redFastPath;
+  bool const useHoist = (redVariant >= 3 && redVariant <= 5) && redFastPath &&
+                        !kernelMeta.mGroupsTokensHeadsQ && (redVariant != 3 || useRed256);
   bool const useMutant = redVariant == 99 && redFastPath;
-  if (redVariant == 1) {
+  if (redVariant == 1 || (redVariant == 5 && useHoist)) {
     numCtasForReduction = numSlices;
   } else if (useRed256) {
     numCtasForReduction = (headDimPerCtaV * 2 * kernelMeta.mTileSizeQ) / (256 * 16);
@@ -550,6 +592,22 @@ void runFmhaReduction(TllmGenFmhaKernelMetaInfo const& kernelMeta, KernelParams 
       kernel = &fmhaReductionKernel<64, 256, true, __nv_bfloat16, __nv_bfloat16, true>;
     } else {
       kernel = &fmhaReductionKernel<64, 512, true, __nv_bfloat16, __nv_bfloat16, true>;
+    }
+  } else if (useHoist && useRed256) {
+    if (headDimPerCtaV == 128) {
+      kernel = &fmhaReductionKernel<64, 128, true, __nv_bfloat16, __nv_bfloat16, false, 256, false, true>;
+    } else if (headDimPerCtaV == 256) {
+      kernel = &fmhaReductionKernel<64, 256, true, __nv_bfloat16, __nv_bfloat16, false, 256, false, true>;
+    } else {
+      kernel = &fmhaReductionKernel<64, 512, true, __nv_bfloat16, __nv_bfloat16, false, 256, false, true>;
+    }
+  } else if (useHoist) {
+    if (headDimPerCtaV == 128) {
+      kernel = &fmhaReductionKernel<64, 128, true, __nv_bfloat16, __nv_bfloat16, false, 512, false, true>;
+    } else if (headDimPerCtaV == 256) {
+      kernel = &fmhaReductionKernel<64, 256, true, __nv_bfloat16, __nv_bfloat16, false, 512, false, true>;
+    } else {
+      kernel = &fmhaReductionKernel<64, 512, true, __nv_bfloat16, __nv_bfloat16, false, 512, false, true>;
     }
   } else if (useRed256) {
     if (headDimPerCtaV == 128) {
