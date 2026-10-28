@@ -1615,6 +1615,7 @@ class GvrMainKernel:
         clus_cs: int = 0,
         clus_stage: bool = False,
         bf16: bool = False,
+        warp_rank: bool = False,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1623,6 +1624,12 @@ class GvrMainKernel:
         # is the fp32 one. xb = bytes per logit in every logits address.
         self.bf16 = bool(bf16)
         self.xb = 2 if self.bf16 else 4
+        # warp-ballot rank of small crossing bins (upstream PR
+        # NVIDIA/TensorRT-LLM#20106, K = 2048 there): with mc <= 32 candidates,
+        # each warp ranks one candidate per step with the 32 candidates in its
+        # lanes, rank = popc(ballot(candidate > target)), instead of every
+        # thread scanning all mc keys in shared memory
+        self.warp_rank = bool(warp_rank)
         assert kpt in (1, 2, 4, 8) and minb in (1, 2, 4)
         self.blk = blk
         self.u = u
@@ -3230,7 +3237,40 @@ class GvrMainKernel:
                     # ---- P6 refine ----
                     if whole == cutlass.Int32(0):
                         cute.arch.barrier()  # ---- barrier (emit done) ----
-                        if mc <= cutlass.Int32(QUADC_CLUS__main):  # O(mc^2) rank
+                        warp_quad = cutlass.Int32(0)
+                        if cutlass.const_expr(self.warp_rank):
+                            if mc <= cutlass.Int32(32):
+                                warp_quad = cutlass.Int32(1)
+                        if warp_quad != cutlass.Int32(0):
+                            # one candidate per warp per step; lane l holds
+                            # candidate l, so the rank is a ballot count. The
+                            # 64-bit (key, column) order is total: ranks are
+                            # distinct, the same as the O(mc^2) rank below.
+                            rank_lane = tidx & cutlass.Int32(31)
+                            rank_i = tidx >> cutlass.Int32(5)
+                            vote_hi = cutlass.Uint32(0)
+                            vote_lo = cutlass.Uint32(0)
+                            if rank_lane < mc:
+                                vote64 = cutlass.Uint64(s_ck64[rank_lane])
+                                vote_hi = cutlass.Uint32(vote64 >> cutlass.Uint64(32))
+                                vote_lo = cutlass.Uint32(vote64 & cutlass.Uint64(0xFFFFFFFF))
+                            while rank_i < mc:
+                                target_hi = cute.arch.shuffle_sync(vote_hi, rank_i)
+                                target_lo = cute.arch.shuffle_sync(vote_lo, rank_i)
+                                rank_vote = cutlass.Int32(0)
+                                if rank_lane < mc:
+                                    if vote_hi > target_hi:
+                                        rank_vote = cutlass.Int32(1)
+                                    if vote_hi == target_hi and vote_lo > target_lo:
+                                        rank_vote = cutlass.Int32(1)
+                                rank_count = C.popc(C.ballot(rank_vote != cutlass.Int32(0)))
+                                if rank_lane == cutlass.Int32(0) and rank_count < need:
+                                    idw = cutlass.Int32(target_lo)
+                                    if cutlass.const_expr(self.prefill):
+                                        idw = idw + s_ofs[0]
+                                    out_row[above + rank_count] = self._ox(pre_idx, s_pt, idw)
+                                rank_i = rank_i + cutlass.Int32(BLK // 32)
+                        elif mc <= cutlass.Int32(QUADC_CLUS__main):  # O(mc^2) rank
                             mc2 = mc & cutlass.Int32(~1)
                             i = tidx
                             while i < mc:
@@ -3763,6 +3803,7 @@ def get_compiled(
     clus_cs: int = 0,
     clus_stage: bool = False,
     bf16: bool = False,
+    warp_rank: bool = False,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3804,6 +3845,7 @@ def get_compiled(
         int(clus_cs),
         bool(clus_stage) if clus_cs else False,
         bool(bf16),
+        bool(warp_rank),
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3824,6 +3866,7 @@ def get_compiled(
             hint_free=bool(hint_free),
             pdl=bool(pdl),
             bf16=bool(bf16),
+            warp_rank=bool(warp_rank),
         )
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
@@ -3850,6 +3893,7 @@ def get_compiled(
             clus_cs=int(clus_cs),
             clus_stage=bool(clus_stage),
             bf16=bool(bf16),
+            warp_rank=bool(warp_rank),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3922,6 +3966,8 @@ def get_compiled(
         name += f"_cl{int(clus_cs)}" + ("s" if clus_stage else "")
     if bf16:
         name += "_bf16"
+    if warp_rank:
+        name += "_wr"
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled
