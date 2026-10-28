@@ -1616,6 +1616,7 @@ class GvrMainKernel:
         clus_stage: bool = False,
         bf16: bool = False,
         warp_rank: bool = False,
+        staged_k: int = 0,
     ):
         assert nbs == 256, "SNB must stay 256"
         assert blk in (256, 512, 1024) and u in (1, 2, 4, 8)
@@ -1706,6 +1707,19 @@ class GvrMainKernel:
         self.pfd = (u if u < 4 else 4) if minb <= 2 else 0
         self.pf = self.pfd > 0
         self.natt = 1 if split else 3
+        # staged output (upstream PR NVIDIA/TensorRT-LLM#20106, K = 2048 one-CTA
+        # slabs there): a streamed row's k outputs are written to shared memory and
+        # copied to the row with 16-byte stores at the end, instead of one
+        # scattered 4-byte global store per winner. The survivor buffer gives up
+        # the bytes, so the CTA's shared memory stays the same; the sampling
+        # ladder keeps the full capacity. Decode, one CTA per row only.
+        self.staged_k = int(staged_k)
+        self.sample_scpb = self.scpb
+        if self.staged_k:
+            assert not split and not prefill and self.staged_k % 4 == 0
+            item_bytes = 8 if self.vstg else 4
+            self.scpb -= ((4 * self.staged_k + 4 * item_bytes - 1) // (4 * item_bytes)) * 4
+            assert self.scpb > 0
         # smem blob byte map: cbuf/cbuf2 alias @0,
         # ck64 @ 4*(VSTG ? 2*(SCPB+4) : SCPB+4), size (CMPB+1)*8
         self.ck_off = 4 * ((2 * (self.scpb + 4)) if self.vstg else (self.scpb + 4))
@@ -2298,7 +2312,12 @@ class GvrMainKernel:
         if cutlass.const_expr(self.varlen):
             prow64 = cutlass.Int64(row // cutlass.Int32(self.next_n))
         p_addr = pre_idx.iterator.toint() + prow64 * cutlass.Int64(k) * cutlass.Int64(4)
-        out_row = out[row, None]
+        if cutlass.const_expr(self.staged_k > 0):
+            out_row = smem.allocate_tensor(
+                cutlass.Int32, cute.make_ordered_layout((self.staged_k,), order=(0,)), byte_alignment=16
+            )
+        else:
+            out_row = out[row, None]
         ws_addr = ws.iterator.toint()
         gdon_addr = ws_addr  # slab views
         goff_addr = ws_addr + cutlass.Int64(C.GVR_WS_OFF_OFF)
@@ -2369,7 +2388,7 @@ class GvrMainKernel:
                     if cutlass.const_expr(self.r_const > 1):
                         if aim < amin:
                             aim = amin
-                    scap_c = cutlass.Int32(SCPB)  # SCAP == SCPB for gvr_main (proven identity)
+                    scap_c = cutlass.Int32(self.sample_scpb)  # SCAP == SCPB for gvr_main (proven identity)
                     if aim > (scap_c >> cutlass.Int32(1)):
                         aim = scap_c >> cutlass.Int32(1)
                     if aim < k:
@@ -3721,6 +3740,30 @@ class GvrMainKernel:
                         out_row[j] = cutlass.Int32(-1)
                         j = j + cutlass.Int32(BLK)
 
+        if cutlass.const_expr(self.staged_k > 0):
+            # staged output: every winner of the row is in out_row (shared
+            # memory, already page-mapped); one barrier, then 16-byte copies
+            cute.arch.barrier()
+            output_atom = C.smem_atom_i32_128()
+            output_fragment = cute.make_rmem_tensor((4,), cutlass.Int32)
+            output_i = tidx * cutlass.Int32(4)
+            while output_i + cutlass.Int32(3) < k:
+                C.lds128_i32(output_atom, out_row.iterator.toint(), output_i * cutlass.Int32(4), output_fragment)
+                output_span = cute.make_tensor(
+                    cute.make_ptr(
+                        cutlass.Int32,
+                        out[row, None].iterator.toint() + cutlass.Int64(output_i * cutlass.Int32(4)),
+                        cute.AddressSpace.gmem,
+                        assumed_align=16,
+                    ),
+                    cute.make_layout((4,)),
+                )
+                cute.copy(output_atom, output_fragment, output_span)
+                output_i = output_i + cutlass.Int32(4 * BLK)
+            output_tail = (k & cutlass.Int32(~3)) + tidx
+            if output_tail < k:
+                out[row, output_tail] = out_row[output_tail]
+
     # ------------------------------------------------------------------
     # host launcher (grid dim3(R, b); MINB wall via min_blocks_per_mp)
     # ------------------------------------------------------------------
@@ -3804,6 +3847,7 @@ def get_compiled(
     clus_stage: bool = False,
     bf16: bool = False,
     warp_rank: bool = False,
+    staged_k: int = 0,
 ):
     """Compile (or fetch) the gvr_main variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG)                — legacy, or
@@ -3846,6 +3890,7 @@ def get_compiled(
         bool(clus_stage) if clus_cs else False,
         bool(bf16),
         bool(warp_rank),
+        int(staged_k),
         C._compile_arch_token(),
     )
     if prefill and len(tpl) != 10:
@@ -3867,6 +3912,7 @@ def get_compiled(
             pdl=bool(pdl),
             bf16=bool(bf16),
             warp_rank=bool(warp_rank),
+            staged_k=int(staged_k),
         )
     else:
         blk, u, minb, nbs, kpt, split, tshg, next_n, cr_shift, r_const = tpl
@@ -3894,6 +3940,7 @@ def get_compiled(
             clus_stage=bool(clus_stage),
             bf16=bool(bf16),
             warp_rank=bool(warp_rank),
+            staged_k=int(staged_k),
         )
     r0, c0 = cute.sym_int(), cute.sym_int()
     r1, c1 = cute.sym_int(), cute.sym_int()
@@ -3968,6 +4015,8 @@ def get_compiled(
         name += "_bf16"
     if warp_rank:
         name += "_wr"
+    if staged_k:
+        name += f"_sk{int(staged_k)}"
     compiled = C._persist(name, _compile_fn)
     _COMPILE_CACHE[key] = compiled
     return compiled

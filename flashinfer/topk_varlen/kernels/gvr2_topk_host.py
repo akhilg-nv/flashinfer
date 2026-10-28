@@ -1061,6 +1061,13 @@ def _warp_rank(k: int) -> bool:
     return int(k) == 2048 and _arch_token().replace("_", "").rstrip("a") in ("sm100", "sm103")
 
 
+def _staged_k(k: int, split: bool) -> int:
+    """Main family: stage the output row in shared memory on the one-CTA slabs
+    (upstream PR NVIDIA/TensorRT-LLM#20106 turns it on for K = 2048 on SM100 /
+    SM103, where it was measured; a compile dimension of the main engines)."""
+    return int(k) if (_warp_rank(k) and not split) else 0
+
+
 def _varlen_launcher(
     num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None, bf16=False
 ):
@@ -1235,6 +1242,7 @@ def _varlen_launcher(
             reg_vpt=_main_reg_vpt(tpl[0], tpl[5], n_kernel),
             bf16=bool(bf16),
             warp_rank=_warp_rank(k),
+            staged_k=_staged_k(k, bool(tpl[5])),
             **clus,
             **pg,
         )
