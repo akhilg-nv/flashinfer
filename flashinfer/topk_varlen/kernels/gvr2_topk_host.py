@@ -294,8 +294,9 @@ def route(b: int, n: int, npad: int, k: int, sms: int = 148) -> dict[str, object
     # family at k <= BLKC because its hint sample is one word per thread; the
     # selection stages (merged scan, cursor emit, crossing-bin tie select,
     # key-space fallback) are k-generic, and the identity write of short rows
-    # strides over k. The bracket then comes from the first BLKC row values
-    # instead of the first k (a looser bracket, same exact result). Measured
+    # strides over k. K > BLKC takes two sample words per thread
+    # (_regclus_hint_slots; upstream TensorRT-LLM samples K = 2048 the same way
+    # since NVIDIA/TensorRT-LLM#20998, which also admits it here). Measured
     # B200, K = 2048, random lengths, vs the streaming slab it replaces:
     # 1.4-2.3x for <= 32 rows at 20K-64K and for <= 64 rows at <= 32K; the
     # 33-37 row band above 32K needs 4-CTA clusters that no longer fit one GPC
@@ -907,6 +908,12 @@ def _reg_stage_out(num_rows: int, sms: int) -> bool:
     return num_rows <= sms
 
 
+def _regclus_hint_slots(k: int) -> int:
+    """Clustered register family: sample words per thread, ceil(k / BLKC) (a
+    compile dimension; the K = 2048 rows this family admits take two)."""
+    return 2 if int(k) > 1024 else 1
+
+
 def _regclus_stage_out(num_rows: int, k: int, paged: bool) -> bool:
     """Clustered register family: staged emit for paged output, except K > 1024
     below 16 rows. Same role as ``_reg_stage_out`` (a compile dimension the
@@ -983,6 +990,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 hint_free=hint_free,
                 pt_smem=0 if stage_rc else pt_smem,
                 stage_out=stage_rc,
+                hint_slots=_regclus_hint_slots(k),
                 **pg,
             )
         )
@@ -2044,7 +2052,9 @@ def _build_launcher(b, n, npad, k):
         # compiled ABI: (logits, pre_idx, kv_lens, out, n) -- kv_lens is the
         # dead varlen slot in batch-uniform mode (cached dummy tensor);
         # smem/k derived in-module
-        fn = _gate_first_call(dev.get_compiled__regclus(tpl))
+        fn = _gate_first_call(
+            dev.get_compiled__regclus(tpl, hint_slots=_regclus_hint_slots(rt["k"]))
+        )
         n_arg = rt["n"]
 
         def _call(lg, pi, idx, _fn=fn, _n=n_arg):

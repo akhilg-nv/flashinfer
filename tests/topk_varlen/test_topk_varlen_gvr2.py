@@ -1029,6 +1029,242 @@ def test_gvr2_posinf_reg_clus(batch, n_valid, mode):
         assert torch.equal(got, ref), "selected value multiset differs from torch.topk"
 
 
+# ---------------------------------------------------------------------------
+# reg_clus hint-free sample and parallel rescue (NVIDIA/TensorRT-LLM#20998)
+# ---------------------------------------------------------------------------
+
+# (rows, columns) taking the clustered register family hint-free, one per
+# cluster geometry: CS=8 VPT=1, CS=8 VPT=4, CS=8 VPT=4 at the family's
+# 131,072-column top, CS=4 VPT=2 (each test asserts the family it ran)
+_RESCUE_SHAPES = [(1, 16399), (4, 65551), (8, 131071), (16, 32771)]
+
+
+def _rescue_row(pattern, n, top_k, gen):
+    """One row of ``n`` scores. ``randn`` and ``late_rise`` keep a finite
+    bracket with a small crossing bin (the spread sample on the normal path);
+    ``late_rise`` is the reported GLM-5.3-Flash anatomy (low first 4,096
+    columns, far higher scores after them), which a first-k sample brackets far
+    below its K-th value. The others defeat the sample: a collapsed bracket
+    (``hidden_peak``: every sampled column, and the first k for the old
+    first-k sample, is 0, the rest 1;
+    ``equal``), an infinite one (``infinities``: +inf and -inf every 7
+    columns), or one bin holding most of the row (``outlier``: the sampled
+    ends at 1e9; ``ties``: 1 with k / 2 columns at 2), so those rows take the
+    sentinel bracket or a crossing bin above the rescue limit."""
+    row = torch.randn(n, generator=gen)
+    if pattern == "late_rise":
+        row[:4096] = torch.rand(4096, generator=gen) * 177.25 - 86.0
+        row[4096:] = row[4096:] * 55.0 + 75.0
+    elif pattern == "hidden_peak":
+        row.fill_(1)
+        sid = torch.arange(top_k)
+        row[(sid // 64) * (n - 64) // (top_k // 64 - 1) + sid % 64] = 0
+        row[:top_k] = 0
+    elif pattern == "outlier":
+        row[0] = row[-1] = 1e9
+    elif pattern == "equal":
+        row.fill_(1)
+    elif pattern == "ties":
+        row.fill_(1)
+        row[torch.randperm(n, generator=gen)[: top_k // 2]] = 2
+    elif pattern == "infinities":
+        row[0::7] = float("inf")
+        row[1::7] = -float("inf")
+    return row
+
+
+def _rescue_case(rows, n, top_k, pattern):
+    """Every row the same ``_rescue_row``, columns past ``n`` poisoned."""
+    gen = torch.Generator().manual_seed(20998 + n + top_k)
+    npad = _round64(n)
+    logits = torch.full((rows, npad), 3e38, dtype=torch.float32, device=_DEV)
+    logits[:, :n] = _rescue_row(pattern, n, top_k, gen).to(_DEV)
+    seq_lens = torch.full((rows,), n, dtype=torch.int32, device=_DEV)
+    return logits, seq_lens, npad
+
+
+def _unpage(out, pt, page_size):
+    """Window-local columns of paged output through the inverse of each row's
+    injective page-table row (one row per request); -1 pads stay -1. A slot
+    outside the row's pages raises KeyError."""
+    shift = page_size.bit_length() - 1
+    cols = torch.full_like(out, -1)
+    for r in range(out.shape[0]):
+        inv = {int(p): j for j, p in enumerate(pt[r].tolist())}
+        for c, slot in enumerate(out[r].tolist()):
+            if slot >= 0:
+                cols[r, c] = (inv[slot >> shift] << shift) | (slot & (page_size - 1))
+    return cols
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "pattern",
+    ["randn", "late_rise", "hidden_peak", "outlier", "equal", "ties", "infinities"],
+)
+@pytest.mark.parametrize("rows,n", _RESCUE_SHAPES, ids=lambda v: str(v))
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+def test_gvr2_reg_clus_rescue_exact(top_k, rows, n, pattern):
+    """Hint-free reg_clus is exact on rows that defeat its sample, eagerly and
+    under CUDA-graph replay, with the output poisoned before every launch (the
+    sample: k / 64 spread blocks, two words per thread at K = 2048)."""
+    logits, seq_lens, npad = _rescue_case(rows, n, top_k, pattern)
+    ref = torch.topk(logits[:, :n], top_k, dim=1).values
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    torch.cuda.synchronize()
+    _assert_family(rows, npad, top_k, 1, 1, "reg_clus", hint_free=True)
+    _check_exact(logits, out, n, ref)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    torch.cuda.current_stream().wait_stream(s)
+    for _ in range(2):
+        out.fill_(-7)
+        g.replay()
+        torch.cuda.synchronize()
+        _check_exact(logits, out, n, ref)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("pattern", ["equal", "ties", "infinities"])
+@pytest.mark.parametrize(
+    "rows,n", [(4, 32771), (16, 32771), (4, 65551)], ids=lambda v: str(v)
+)
+@pytest.mark.parametrize("top_k", [512, 2048])
+def test_gvr2_reg_clus_rescue_paged(top_k, rows, n, pattern):
+    """The rescue's emits under paged output, mapped back through a random
+    injective page table: staged into rank 0 for the coalesced epilogue (K =
+    512, and K = 2048 at 16 rows), through the smem-staged table row (K = 2048
+    at 4 x 32,771: 513 pages) and through the global table (K = 2048 at 4 x
+    65,551: 1,026 pages, too many to stage)."""
+    page_size = 64
+    logits, seq_lens, npad = _rescue_case(rows, n, top_k, pattern)
+    gen = torch.Generator(device=_DEV).manual_seed(rows + n + top_k)
+    pages = npad // page_size
+    pt = torch.stack(
+        [
+            torch.randperm(4 * pages + 7, generator=gen, device=_DEV)[:pages]
+            for _ in range(rows)
+        ]
+    ).to(torch.int32)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(
+        logits,
+        seq_lens,
+        top_k,
+        None,
+        out_indices=out,
+        page_table=pt,
+        page_size=page_size,
+    )
+    torch.cuda.synchronize()
+    key = (
+        rows,
+        npad,
+        top_k,
+        npad,
+        1,
+        1,
+        True,
+        6,  # log2(page_size)
+        _host._arch_token(),
+        _host._sm_count(),
+    )
+    lc = _host._VARLEN_CACHE.get(key)
+    assert lc is not None and lc[0] == "reg_clus", key
+    _check_exact(
+        logits,
+        _unpage(out, pt, page_size),
+        n,
+        torch.topk(logits[:, :n], top_k).values,
+    )
+
+
+@requires_gvr2
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+def test_gvr2_reg_clus_rescue_scalar_tail(top_k):
+    """Rows whose only finite scores are the scalar tail (the n % 4 columns
+    past the last whole float4, held by rank 0 alone): the K-th value is -inf
+    (sentinel bracket, parallel rescue), so every tail score is a strict
+    winner and must be counted and emitted once, not also from the partial
+    float4 slot over it."""
+    envelope = 131072
+    valid = [base + tail for base in (top_k, 65536) for tail in (1, 2, 3)]
+    rows = len(valid)
+    logits = torch.full((rows, envelope), 3e38, dtype=torch.float32, device=_DEV)
+    for r, v in enumerate(valid):
+        logits[r, :v] = -float("inf")
+        logits[r, v // 4 * 4 : v] = 1
+    seq_lens = torch.tensor(valid, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    torch.cuda.synchronize()
+    _assert_family(rows, envelope, top_k, 1, 1, "reg_clus", hint_free=True)
+    _check_varlen_rows(logits, out, valid, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("candidates", [16384, 16385])
+@pytest.mark.parametrize("tied", [False, True], ids=["spread", "tied"])
+def test_gvr2_reg_clus_rescue_limit(top_k, candidates, tied):
+    """Both sides of the hint-free rescue limit (16,384 candidates in the
+    crossing bin at this shape): rank 0's narrowing of the staged candidates
+    at 16,384, the parallel rescue at 16,385. k / 2 strict winners at 2, the
+    candidates at 1 (tied) or spread over [1, 1.0001] inside one bin, 0
+    elsewhere; the sample sees all three levels."""
+    n = 65551
+    npad = _round64(n)
+    logits = torch.full((1, npad), 3e38, dtype=torch.float32, device=_DEV)
+    logits[:, :n] = 0
+    logits[:, : top_k // 2] = 2
+    begin = (n - candidates) // 2
+    logits[:, begin : begin + candidates] = (
+        1.0 if tied else torch.linspace(1, 1.0001, candidates, device=_DEV)
+    )
+    seq_lens = torch.tensor([n], dtype=torch.int32, device=_DEV)
+    out = torch.full((1, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    torch.cuda.synchronize()
+    _assert_family(1, npad, top_k, 1, 1, "reg_clus", hint_free=True)
+    _check_exact(logits, out, n, torch.topk(logits[:, :n], top_k).values)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("top_k", [512, 1024, 2048])
+@pytest.mark.parametrize("cr", [1, 4])
+def test_gvr2_reg_clus_rescue_mtp_rows(top_k, cr):
+    """One MTP launch (next_n = 4) mixing empty windows, identity rows (n <=
+    k, which leave before any cluster barrier) and long all-equal rows whose
+    clusters run the rescue's barriers."""
+    next_n = 4
+    width = _round64(32771)
+    raw = [0, (top_k - 1) * cr, top_k * cr + next_n - 1, 32771 * cr + next_n - 1]
+    rows = len(raw) * next_n
+    valid = _row_valid_lens(raw, rows, next_n, cr, width)
+    logits = torch.full((rows, width), 3e38, dtype=torch.float32, device=_DEV)
+    for r, v in enumerate(valid):
+        logits[r, :v] = 1
+    seq_lens = torch.tensor(raw, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(
+        logits,
+        seq_lens,
+        top_k,
+        None,
+        out_indices=out,
+        next_n=next_n,
+        compress_ratio=cr,
+    )
+    torch.cuda.synchronize()
+    _assert_family(rows, width, top_k, next_n, cr, "reg_clus", hint_free=True)
+    assert max(valid) > top_k and min(valid) == 0, valid
+    _check_varlen_rows(logits, out, valid, top_k)
+
+
 @requires_gvr2
 @pytest.mark.parametrize(
     "kv", [200, 256, 100000], ids=["in_range", "equal_width", "oversized"]
