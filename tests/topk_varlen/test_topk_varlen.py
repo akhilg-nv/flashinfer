@@ -1123,7 +1123,8 @@ def test_out_values_ignored_when_return_values_false(backend, load_balance):
     (without the 'out_values if return_output_values else None' guard) causes a
     type mismatch.  Covers all backends plus both GVR load-balance paths.
     """
-    # gvr_2 is fp32-only; the other backends keep the original bf16 coverage.
+    # gvr_2 runs fp32 here (its bf16 coverage is in test_topk_varlen_gvr2.py);
+    # the other backends keep the original bf16 coverage.
     dtype = torch.float32 if backend == "gvr_2" else torch.bfloat16
     top_k, N, batch_size = 512, 8192, 4
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=99)

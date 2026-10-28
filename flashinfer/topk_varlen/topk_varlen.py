@@ -326,9 +326,11 @@ def _gvr2_top_k_varlen_check(
     _, compress_ratio = _decode_defaults(next_n, compress_ratio)
     if not _cute_dsl_ready(logits.device):
         return False
-    # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
-    # follow-up (run_varlen raises on any other dtype).
-    if logits.dtype != torch.float32:
+    # fp32, and bf16 in decode mode (loaded at half width, widened exactly to
+    # fp32 on chip); no fp16, no bf16 windows (run_varlen raises on those).
+    if logits.dtype != torch.float32 and (
+        logits.dtype != torch.bfloat16 or row_starts is not None
+    ):
         return False
     # Validated K domain (matches the upstream dispatch tuning + dsa.py gate).
     if top_k not in (512, 1024, 2048):
@@ -347,7 +349,8 @@ def _gvr2_top_k_varlen_check(
     npad = logits.stride(0) if logits.shape[0] > 1 else logits.shape[1]
     if npad % 4 != 0:
         return False
-    if logits.is_cuda and (logits.data_ptr() & 15):
+    # 16-byte float4 loads (fp32), 8-byte loads of four values (bf16)
+    if logits.is_cuda and (logits.data_ptr() & (7 if logits.dtype == torch.bfloat16 else 15)):
         return False
     return True
 
@@ -493,6 +496,10 @@ def _top_k_varlen_heuristic(
         order = ["radix_filter", "gvr_2"] + [
             b for b in order if b not in ("radix_filter", "gvr_2")
         ]
+    if not fp32:
+        # gvr_2 takes bf16 logits, but auto has no bf16 measurements of it
+        # yet: it ranks last for half precision (backend="gvr_2" runs it)
+        order = [b for b in order if b != "gvr_2"] + ["gvr_2"]
     return [b for b in order if b in suitable_backends]
 
 
@@ -1833,15 +1840,18 @@ def top_k_varlen(
                               only.
         ``"gvr_2"``         — Self-sampling GVR V2 kernel.
                               SM100, SM103 or SM107 with an installed CuTe DSL.
-                              fp32 only; unit inner stride, row stride a
-                              multiple of 4 elements (for a single row, the
-                              width), 16-byte-aligned base, non-overlapping
-                              rows (a row stride wider than ``num_cols`` is
-                              fine); ``top_k`` in {512, 1024, 2048};
-                              ``compress_ratio`` 1 or 4; ``pre_idx`` optional,
-                              affecting only the speed; ``load_balance``
-                              ignored; padded value slots hold
-                              ``finfo(float32).min``; NaN ordering is
+                              fp32, or bf16 in decode mode (each value widened
+                              exactly to fp32 on chip; ``auto`` does not pick
+                              gvr_2 for bf16 yet); unit inner stride, row
+                              stride a multiple of 4 elements (for a single
+                              row, the width), 16-byte-aligned base (8-byte
+                              for bf16), non-overlapping rows (a row stride
+                              wider than ``num_cols`` is fine); ``top_k`` in
+                              {512, 1024, 2048}; ``compress_ratio`` 1 or 4;
+                              ``pre_idx`` optional, affecting only the speed;
+                              ``load_balance`` ignored; padded value slots
+                              hold the dtype's most negative finite value
+                              (``finfo(dtype).min``); NaN ordering is
                               implementation-specific. Decode mode, and the
                               only backend of windowed (prefill) mode. CUDA
                               graphs: a geometry must be compiled before it is

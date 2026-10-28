@@ -150,8 +150,9 @@ def _check_varlen_rows(logits, indices, n_r, top_k, values=None):
                     assert torch.equal(values[r, :n], logits[r, :n]), (
                         f"row {r}: short-path values head"
                     )
-                assert bool((values[r, n:] == _FMIN).all()), (
-                    f"row {r}: values tail not -FLT_MAX"
+                pad = torch.finfo(values.dtype).min  # -FLT_MAX for fp32 values
+                assert bool((values[r, n:] == pad).all()), (
+                    f"row {r}: values tail not the dtype's most negative finite value"
                 )
         else:
             idx = indices[r].to(torch.int64)
@@ -536,13 +537,22 @@ def test_gvr2_workspace_override():
 
 
 def _launcher_key(
-    rows, msl_c, top_k, next_n, cr, hint_free=False, n_env=None, page_shift=None
+    rows,
+    msl_c,
+    top_k,
+    next_n,
+    cr,
+    hint_free=False,
+    n_env=None,
+    page_shift=None,
+    bf16=False,
 ):
     """The varlen launcher cache key of a decode launch. ``n_env`` is the launch
     envelope in columns (default: the buffer width ``msl_c``; a decode
     ``max_window_len`` bound sets it below that); ``page_shift`` is log2 of the
-    page size of paged output (None: unpaged)."""
-    return (
+    page size of paged output (None: unpaged); ``bf16`` marks a bf16-logits
+    launch (its key carries one more field)."""
+    key = (
         rows,
         msl_c,
         top_k,
@@ -554,6 +564,7 @@ def _launcher_key(
         _host._arch_token(),
         _host._sm_count(),
     )
+    return key + ("bf16",) if bf16 else key
 
 
 def _forget_launcher(*key_args, **key_kw):
@@ -572,12 +583,23 @@ def _b200_family(family):
 
 
 def _assert_family(
-    rows, msl_c, top_k, next_n, cr, want, hint_free=False, n_env=None, page_shift=None
+    rows,
+    msl_c,
+    top_k,
+    next_n,
+    cr,
+    want,
+    hint_free=False,
+    n_env=None,
+    page_shift=None,
+    bf16=False,
 ):
     """The varlen launcher must admit the same family the free route picks.
     Call _forget_launcher with the same key first: the key must then be one
     the launch in between built. ``want`` None checks the key only."""
-    key = _launcher_key(rows, msl_c, top_k, next_n, cr, hint_free, n_env, page_shift)
+    key = _launcher_key(
+        rows, msl_c, top_k, next_n, cr, hint_free, n_env, page_shift, bf16
+    )
     lc = _host._VARLEN_CACHE.get(key)
     assert lc is not None, f"launcher not cached for {key}"
     if want is not None:
@@ -2937,12 +2959,333 @@ def test_gvr2_empty_batch():
 
 
 @requires_gvr2
-def test_gvr2_rejects_non_fp32():
-    logits = torch.randn(4, 8192, dtype=torch.bfloat16, device=_DEV)
+def test_gvr2_dtype_admission():
+    """fp16 logits and bf16 windows (prefill mode) are refused; bf16 decode
+    runs (its exactness is tested below)."""
     seq_lens = torch.full((4,), 8192, dtype=torch.int32, device=_DEV)
     pre_idx = torch.zeros(4, 512, dtype=torch.int32, device=_DEV)
+    half = torch.randn(4, 8192, dtype=torch.float16, device=_DEV)
     with pytest.raises(Exception, match=r"not supported|Problem size"):
-        flashinfer.top_k_varlen(logits, seq_lens, 512, pre_idx=pre_idx, backend="gvr_2")
+        flashinfer.top_k_varlen(half, seq_lens, 512, pre_idx=pre_idx, backend="gvr_2")
+    bf = torch.randn(4, 8192, dtype=torch.bfloat16, device=_DEV)
+    starts = torch.zeros(4, dtype=torch.int32, device=_DEV)
+    with pytest.raises(Exception, match=r"not supported|Problem size"):
+        flashinfer.top_k_varlen(bf, seq_lens, 512, row_starts=starts, backend="gvr_2")
+    indices, _ = flashinfer.top_k_varlen(bf, seq_lens, 512, backend="gvr_2")
+    _check_varlen_rows(bf, indices, [8192] * 4, 512)
+
+
+# ---------------------------------------------------------------------------
+# bf16 logits (decode mode): every engine loads them at half width and widens
+# each value exactly to fp32 on chip, so it ranks the bf16 values exactly
+# ---------------------------------------------------------------------------
+
+# (rows, msl_c, top_k, next_n, cr, family on B200): the family-parity table,
+# plus the BLK 512 VSTG slab (its survivor re-read rides the parked stride
+# word), and SPLIT launches at serving capacity, whose rows of mixed lengths
+# reach the in-kernel register path, the cluster register path and the slab
+_BF16_SHAPES = [
+    (8, 131072, 1024, 4, 4, "reg_clus"),
+    (8, 32768, 2048, 1, 1, "reg_clus"),
+    (64, 32768, 2048, 1, 1, "reg_clus"),
+    (4, 65536, 2048, 2, 1, "reg_clus"),
+    (100, 65536, 512, 1, 1, "main"),
+    (148, 32768, 2048, 1, 1, "main"),
+    (8, 6144, 512, 1, 4, "reg"),
+    (8, 8192, 512, 1, 1, "reg"),
+    (256, 8192, 512, 1, 1, "reg"),
+    (8, 12288, 512, 1, 1, "reg"),
+    (8, 3072, 512, 1, 4, "reg"),
+    (64, 131072, 1024, 1, 1, "clus"),
+    (32, 131072, 1024, 1, 1, "clus"),
+    (304, 65536, 1024, 1, 1, "main"),
+    (200, 65536, 512, 1, 1, "main"),
+    (8, 1048576, 512, 1, 1, "main"),
+    (4, 262144, 2048, 1, 1, "main"),
+]
+
+
+def _bf16_lengths(rows, msl_c, top_k, next_n, cr, gen):
+    """Per-request kv lengths: the envelope (pinned, so route sees the full
+    width), a short request (the identity path), lengths of every n % 4 and
+    random ones."""
+    batch = rows // next_n
+    kv = [
+        int(torch.randint(1, msl_c * cr + 1, (1,), generator=gen, device=_DEV))
+        for _ in range(batch)
+    ]
+    kv[0] = msl_c * cr
+    if batch > 1:
+        kv[1] = (top_k // 2) * cr
+    for j in range(2, min(batch, 6)):
+        kv[j] = min(msl_c * cr, (top_k + 1 + j * 997) * cr + j)
+    if batch > 6 and msl_c >= 1048576:
+        kv[6:8] = [3000 * cr, 60000 * cr]  # register and cluster-path lengths
+    return kv
+
+
+def _bf16_logits(pattern, n_r, width, top_k, seed):
+    """fp32 scores of the pattern rounded to bf16 last, poison 3e38 (2.99e38 in
+    bf16) past each row's valid length: ``randn`` (rounding alone ties a few
+    values at the K-th), ``ties`` (quarter steps: large tie classes), ``inf``
+    (+inf and -inf scattered; one row with fewer than k finite scores)."""
+    gen = torch.Generator(device=_DEV).manual_seed(seed)
+    rows = len(n_r)
+    x = torch.randn(rows, width, generator=gen, device=_DEV) * 3.0
+    if pattern == "ties":
+        x = (x * 4).round() / 4
+    elif pattern == "inf":
+        for r, n in enumerate(n_r):
+            if n > top_k:
+                pos = torch.randperm(n, generator=gen, device=_DEV)
+                x[r, pos[: top_k // 4]] = float("inf")
+                x[r, pos[top_k // 4 : top_k // 2]] = -float("inf")
+        r = next((r for r, n in enumerate(n_r) if n > 2 * top_k), None)
+        if r is not None:
+            x[r, : n_r[r]] = -float("inf")
+            x[r, torch.randperm(n_r[r], generator=gen, device=_DEV)[: top_k // 2]] = 1.0
+    for r, n in enumerate(n_r):
+        x[r, n:] = 3e38
+    return x.to(torch.bfloat16)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("pattern", ["randn", "ties", "inf"])
+@pytest.mark.parametrize("hinted", [False, True], ids=["hint_free", "hinted"])
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k,next_n,cr,family",
+    _BF16_SHAPES,
+    ids=lambda v: str(v),
+)
+def test_gvr2_bf16_every_family(
+    rows, msl_c, top_k, next_n, cr, family, hinted, pattern
+):
+    """bf16 logits on every engine family, hinted and hint-free, eagerly and
+    under CUDA-graph replay with the outputs poisoned before every launch:
+    exact over the bf16 values (a swapped half in the widening, a 4-byte
+    factor left in a row base or a scalar re-read at the wrong width breaks the
+    value multiset), values returned in bf16, value pads the most negative
+    finite bf16."""
+    assert rows % next_n == 0
+    batch = rows // next_n
+    gen = torch.Generator(device=_DEV).manual_seed(rows + msl_c + top_k)
+    kv = _bf16_lengths(rows, msl_c, top_k, next_n, cr, gen)
+    n_r = _row_valid_lens(kv, rows, next_n, cr, msl_c)
+    logits = _bf16_logits(pattern, n_r, msl_c, top_k, seed=rows * 7 + msl_c)
+    seq_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    pre_idx = None
+    if hinted:
+        pre_idx = torch.zeros(batch, top_k, dtype=torch.int32, device=_DEV)
+        for b in range(batch):
+            lo = max(min(n_r[b * next_n : (b + 1) * next_n]), 1)
+            pre_idx[b] = torch.randint(
+                0, lo, (top_k,), generator=gen, device=_DEV, dtype=torch.int32
+            )
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    vals = torch.full((rows, top_k), float("nan"), dtype=torch.bfloat16, device=_DEV)
+    # an explicit slab: the capture below runs on a stream no eager call used
+    ws = torch.zeros(_host.workspace_bytes(), dtype=torch.uint8, device=_DEV)
+    kw = dict(
+        next_n=next_n,
+        compress_ratio=cr,
+        out_indices=out,
+        out_values=vals,
+        workspace={"gvr2_workspace": ws},
+    )
+    _forget_launcher(rows, msl_c, top_k, next_n, cr, not hinted, bf16=True)
+    # indices alone first: a wrong index fails the range / multiset checks here,
+    # before the values path gathers through it
+    kw_idx = {key: v for key, v in kw.items() if key != "out_values"}
+    _run_gvr2(logits, seq_lens, top_k, pre_idx, **kw_idx)
+    torch.cuda.synchronize()
+    _assert_family(
+        rows, msl_c, top_k, next_n, cr, _b200_family(family), not hinted, bf16=True
+    )
+    _check_varlen_rows(logits, out, n_r, top_k)
+    out.fill_(-7)
+    _run_gvr2(logits, seq_lens, top_k, pre_idx, return_values=True, **kw)
+    torch.cuda.synchronize()
+    _check_varlen_rows(logits, out, n_r, top_k, values=vals)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(logits, seq_lens, top_k, pre_idx, return_values=True, **kw)
+    torch.cuda.current_stream().wait_stream(s)
+    for _ in range(2):
+        out.fill_(-7)
+        vals.fill_(float("nan"))
+        g.replay()
+        torch.cuda.synchronize()
+        _check_varlen_rows(logits, out, n_r, top_k, values=vals)
+
+
+def _unpage_rows(out, pt, page_size, next_n):
+    """Window-local columns of paged output through the inverse of each
+    request's injective page-table row; -1 stays -1. A slot outside the
+    request's pages raises KeyError."""
+    shift = page_size.bit_length() - 1
+    cols = torch.full_like(out, -1)
+    for r in range(out.shape[0]):
+        inv = {int(p): j for j, p in enumerate(pt[r // next_n].tolist())}
+        for c, slot in enumerate(out[r].tolist()):
+            if slot >= 0:
+                cols[r, c] = (inv[slot >> shift] << shift) | (slot & (page_size - 1))
+    return cols
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k,next_n,cr,family",
+    [
+        (8, 8192, 512, 1, 1, "reg"),
+        (8, 32768, 2048, 1, 1, "reg_clus"),
+        (64, 131072, 1024, 1, 1, "clus"),
+        (100, 65536, 512, 1, 1, "main"),
+        (8, 1048576, 512, 1, 1, "main"),
+    ],
+    ids=lambda v: str(v),
+)
+def test_gvr2_bf16_paged(rows, msl_c, top_k, next_n, cr, family):
+    """bf16 logits with page-table output, mapped back through a random
+    injective table and checked against torch.topk of the bf16 values (tie-safe:
+    two launches may keep different threshold ties)."""
+    page_size = 64
+    batch = rows // next_n
+    gen = torch.Generator(device=_DEV).manual_seed(rows + msl_c)
+    kv = _bf16_lengths(rows, msl_c, top_k, next_n, cr, gen)
+    n_r = _row_valid_lens(kv, rows, next_n, cr, msl_c)
+    logits = _bf16_logits("ties", n_r, msl_c, top_k, seed=msl_c + 3)
+    seq_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    pages = msl_c // page_size
+    pt = torch.stack(
+        [
+            torch.randperm(4 * pages + 7, generator=gen, device=_DEV)[:pages]
+            for _ in range(batch)
+        ]
+    ).to(torch.int32)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _forget_launcher(rows, msl_c, top_k, next_n, cr, True, page_shift=6, bf16=True)
+    _run_gvr2(
+        logits,
+        seq_lens,
+        top_k,
+        None,
+        next_n=next_n,
+        compress_ratio=cr,
+        out_indices=out,
+        page_table=pt,
+        page_size=page_size,
+    )
+    torch.cuda.synchronize()
+    _assert_family(
+        rows,
+        msl_c,
+        top_k,
+        next_n,
+        cr,
+        _b200_family(family),
+        True,
+        page_shift=6,
+        bf16=True,
+    )
+    _check_varlen_rows(logits, _unpage_rows(out, pt, page_size, next_n), n_r, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize(
+    "rows,msl_c,top_k",
+    [(8, 8192, 512), (8, 32768, 2048), (64, 131072, 1024), (100, 65536, 512)],
+    ids=lambda v: str(v),
+)
+def test_gvr2_bf16_and_fp32_share_a_geometry(rows, msl_c, top_k):
+    """fp32, then bf16, then fp32 again at one geometry, hinted and hint-free,
+    in one process: each dtype must get its own launcher and compiled engine (a
+    dtype missing from a launcher key, compile key or persist name would run one
+    dtype's engine on the other's buffer and fail the value check). Then a
+    bf16 warm-up followed by a bf16 capture at a new row count."""
+    gen = torch.Generator(device=_DEV).manual_seed(rows + top_k)
+    kv = _bf16_lengths(rows, msl_c, top_k, 1, 1, gen)
+    n_r = _row_valid_lens(kv, rows, 1, 1, msl_c)
+    bf = _bf16_logits("randn", n_r, msl_c, top_k, seed=5)
+    f32 = bf.float() + torch.randn(rows, msl_c, generator=gen, device=_DEV) * 1e-3
+    for r, n in enumerate(n_r):
+        f32[r, n:] = 3e38
+    seq_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    for logits in (f32, bf, f32, bf):
+        for hint in (None, torch.zeros(rows, top_k, dtype=torch.int32, device=_DEV)):
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+            _run_gvr2(logits, seq_lens, top_k, hint, out_indices=out)
+            torch.cuda.synchronize()
+            _check_varlen_rows(logits, out, n_r, top_k)
+    rows2 = rows + 1
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):  # warm up on the stream that captures
+        _host.warmup_varlen(
+            top_k, msl_c, num_rows_list=(rows2,), row_stride=msl_c, dtype=torch.bfloat16
+        )
+    kv2 = kv + [msl_c]
+    n_r2 = n_r + [msl_c]
+    bf2 = _bf16_logits("ties", n_r2, msl_c, top_k, seed=9)
+    seq2 = torch.tensor(kv2, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows2, top_k), -7, dtype=torch.int32, device=_DEV)
+    s.wait_stream(torch.cuda.current_stream())
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
+        _run_gvr2(bf2, seq2, top_k, None, out_indices=out)
+    torch.cuda.current_stream().wait_stream(s)
+    out.fill_(-7)
+    g.replay()
+    torch.cuda.synchronize()
+    _check_varlen_rows(bf2, out, n_r2, top_k)
+
+
+@requires_gvr2
+@pytest.mark.parametrize("width,stride", [(8192, 8448), (65536, 65792)])
+def test_gvr2_bf16_arena_view(width, stride):
+    """A bf16 logits view whose row stride exceeds its width (a paged-MQA
+    arena): every row past the first is read at the bf16 row pitch."""
+    rows, top_k = 6, 512
+    gen = torch.Generator(device=_DEV).manual_seed(width)
+    arena = (torch.randn(rows, stride, generator=gen, device=_DEV) * 3.0).to(
+        torch.bfloat16
+    )
+    logits = arena[:, :width]
+    kv = [width, 4099, 513, width - 1, 7777, width - 2]
+    seq_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    _run_gvr2(logits, seq_lens, top_k, None, out_indices=out)
+    torch.cuda.synchronize()
+    _check_varlen_rows(logits, out, kv, top_k)
+
+
+@requires_gvr2
+def test_gvr2_bf16_reference_engine():
+    """The reference engine on bf16 logits (the fp32 kernels on the exact
+    upcast) agrees with torch.topk of the bf16 values, values included."""
+    rows, width, top_k = 4, 16384, 512
+    kv = [width, 300, 9001, 16383]
+    logits = _bf16_logits("ties", kv, width, top_k, seed=11)
+    seq_lens = torch.tensor(kv, dtype=torch.int32, device=_DEV)
+    out = torch.full((rows, top_k), -7, dtype=torch.int32, device=_DEV)
+    vals = torch.full((rows, top_k), float("nan"), dtype=torch.bfloat16, device=_DEV)
+    _host.run_varlen(
+        logits, None, seq_lens, out, values=vals, top_k=top_k, engine="reference"
+    )
+    torch.cuda.synchronize()
+    _check_varlen_rows(logits, out, kv, top_k, values=vals)
+
+
+@requires_gvr2
+def test_gvr2_auto_ranks_gvr2_last_for_bf16():
+    """gvr_2 takes bf16 but auto has no bf16 measurements of it: with bf16
+    logits it ranks last among the suitable backends."""
+    logits = torch.randn(4, 8192, dtype=torch.bfloat16, device=_DEV)
+    seq_lens = torch.full((4,), 8192, dtype=torch.int32, device=_DEV)
+    indices, _ = flashinfer.top_k_varlen(logits, seq_lens, 512, backend="auto")
+    order = flashinfer.top_k_varlen.suitable_auto_backends
+    assert "gvr_2" in order and order[-1] == "gvr_2" and len(order) > 1, order
 
 
 @requires_gvr2

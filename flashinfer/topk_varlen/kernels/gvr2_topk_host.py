@@ -1054,7 +1054,9 @@ def _main_engine(num_rows, n_route, npad, k, paged):
     return tpl, r_const, clus, plan["rt"]
 
 
-def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None):
+def _varlen_launcher(
+    num_rows, npad, k, n_env, next_n, cr, hint_free=False, page_shift=None, bf16=False
+):
     """Capture-time varlen plan + compiled launcher.  The gvr_main port is
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
@@ -1066,7 +1068,9 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
     sample alone. Part of the cache key (distinct compiled objects).
     ``page_shift`` (log2 page size, hint-free only) selects the PAGED engines: the
     page table rides in the dead pre_idx slot and every emitted index leaves the
-    kernel as a physical KV slot (see ``_pt_xf`` in the device module)."""
+    kernel as a physical KV slot (see ``_pt_xf`` in the device module).
+    ``bf16`` selects the engines that read bf16 logits (widened on load); it
+    extends the key only when set, so fp32 keys keep their shape."""
     sms = _sm_count()
     hint_free = bool(hint_free)
     paged = page_shift is not None
@@ -1081,6 +1085,8 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
         if need_pages <= 1024:
             pt_smem = 1 << max(need_pages - 1, 0).bit_length()
     key = (num_rows, npad, k, n_env, next_n, cr, hint_free, page_shift, _arch_token(), sms)
+    if bf16:
+        key = key + ("bf16",)
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1123,6 +1129,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 hint_free=hint_free,
                 pt_smem=0 if stage_rc else pt_smem,
                 stage_out=stage_rc,
+                bf16=bool(bf16),
                 **pg,
             )
         )
@@ -1151,6 +1158,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 hint_free=hint_free,
                 pt_smem=pt_smem,
                 stage_out=stage_out,
+                bf16=bool(bf16),
                 **pg,
             )
         )
@@ -1196,6 +1204,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
                 pdl=_DECODE_PDL,
                 solo=True,
                 reg_vpt=_CLUS_REG_VPT,
+                bf16=bool(bf16),
                 **pg,
             )
         )
@@ -1217,6 +1226,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr, hint_free=False, page
             pt_smem=pt_smem,
             pdl=_DECODE_PDL,
             reg_vpt=_main_reg_vpt(tpl[0], tpl[5], n_kernel),
+            bf16=bool(bf16),
             **clus,
             **pg,
         )
@@ -2119,6 +2129,7 @@ def _dummy_kv(dev_index, device):
 # hot-path local bindings: each torch.<attr> lookup costs ~0.1 us and the
 # validation battery runs on EVERY call
 _F32 = torch.float32
+_BF16 = torch.bfloat16
 _I32 = torch.int32
 _TENSOR = torch.Tensor
 _is_capturing = torch.cuda.is_current_stream_capturing
@@ -2481,11 +2492,12 @@ def run_varlen(
                 page_table=page_table,
                 page_size=page_size,
             )
-    if logits.dtype is not torch.float32:
-        raise RuntimeError(
-            f"logits must be float32 (got {logits.dtype}); bf16/fp16 paths "
-            "are a follow-up — see the PR roadmap"
-        )
+    # bf16 logits (decode mode): the engines load them at half width and widen
+    # each value exactly to fp32 in registers, so they rank the bf16 values
+    # exactly; fp16 is not supported
+    if logits.dtype is not _F32 and logits.dtype is not _BF16:
+        raise RuntimeError(f"logits must be float32 or bfloat16 (got {logits.dtype})")
+    bf16 = logits.dtype is _BF16
     if not (isinstance(kv_lens, _TENSOR) and kv_lens.is_cuda):
         raise RuntimeError("kv_lens must be a CUDA tensor")
     if kv_lens.dtype is not _I32:
@@ -2559,6 +2571,8 @@ def run_varlen(
             )
         if not row_starts.is_contiguous():
             raise RuntimeError("row_starts must be contiguous")
+        if bf16:
+            raise RuntimeError("row_starts (windowed / prefill mode) takes float32 logits")
     elif absolute_indices:
         raise RuntimeError("absolute_indices requires row_starts (windowed / prefill mode)")
     paged = page_table is not None
@@ -2621,11 +2635,11 @@ def run_varlen(
         if not (logits.is_cuda and indices.is_cuda and (hint_free or pre_idx.is_cuda)):
             raise RuntimeError("all tensors must be CUDA")
         if (
-            logits.dtype is not _F32
+            (logits.dtype is not _F32 and logits.dtype is not _BF16)
             or indices.dtype is not _I32
             or (not hint_free and pre_idx.dtype is not _I32)
         ):
-            raise RuntimeError("logits must be float32; pre_idx/indices int32")
+            raise RuntimeError("logits must be float32 or bfloat16; pre_idx/indices int32")
         if len(indices.shape) != 2 or indices.shape[0] != num_rows:
             raise RuntimeError(
                 f"indices must be [num_rows={num_rows}, >=k], got {tuple(indices.shape)}"
@@ -2662,16 +2676,17 @@ def run_varlen(
         lg = logits
         if not logits.is_contiguous():
             need = logits.storage_offset() + num_rows * npad
-            if logits.untyped_storage().size() // 4 < need:
+            if logits.untyped_storage().size() // logits.element_size() < need:
                 raise RuntimeError("logits view storage too small to widen to its row stride")
             lg = logits.as_strided((num_rows, npad), (npad, 1), logits.storage_offset())
         if npad & 3:
             raise RuntimeError(f"npad (logits row stride) must be a multiple of 4, got {npad}")
-        if lg.data_ptr() & 15:
-            raise RuntimeError("logits base must be 16-byte aligned")
+        # the row loads are 16-byte float4 (fp32) or 8-byte (four bf16) vectors
+        if lg.data_ptr() & (7 if bf16 else 15):
+            raise RuntimeError(f"logits base must be {8 if bf16 else 16}-byte aligned")
         if values is not None:
-            if not values.is_cuda or values.dtype is not _F32:
-                raise RuntimeError("values must be CUDA float32")
+            if not values.is_cuda or values.dtype is not logits.dtype:
+                raise RuntimeError(f"values must be CUDA {logits.dtype} (the logits dtype)")
             if (
                 len(values.shape) != 2
                 or values.shape[0] != num_rows
@@ -2741,6 +2756,8 @@ def run_varlen(
                 vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
             return
         key = (num_rows, npad, k, n_env, nn, cr, hint_free, page_shift, _arch_token(), _sm_count())
+        if bf16:
+            key = key + ("bf16",)  # as _varlen_launcher keys it
         lc = _VARLEN_CACHE.get(key)
         if lc is None:
             if _is_capturing():
@@ -2748,7 +2765,7 @@ def run_varlen(
                     "varlen launcher not compiled for this shape — warm up "
                     "before CUDA graph capture"
                 )
-            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, hint_free, page_shift)
+            lc = _varlen_launcher(num_rows, npad, k, n_env, nn, cr, hint_free, page_shift, bf16)
         idx = indices
         if idx.shape[1] != k:
             idx = idx.reshape(-1)[: num_rows * k].view(num_rows, k)
@@ -2779,7 +2796,8 @@ def run_varlen(
         if vals is not None:
             idx64 = idx.to(torch.int64)
             vals.copy_(lg.gather(1, idx64.clamp_min(0)))
-            vals.masked_fill_(idx < 0, torch.finfo(_F32).min)
+            # padding: the most negative finite value of the logits dtype
+            vals.masked_fill_(idx < 0, torch.finfo(logits.dtype).min)
         return
     if engine != "reference":
         raise RuntimeError(f"engine must be 'auto' or 'reference', got {engine!r}")
@@ -2810,6 +2828,13 @@ def run_varlen(
     vals = values
     if vals is not None and vals.shape[1] != k:
         vals = vals.reshape(-1)[: num_rows * k].view(num_rows, k)
+    vals_out = None
+    if bf16:
+        # the fp32 kernels rank the exact upcast (bf16 widens exactly); values
+        # are written to an fp32 copy and narrowed back at the end (exact)
+        logits = logits.float()
+        if vals is not None:
+            vals_out, vals = vals, torch.empty(vals.shape, dtype=_F32, device=vals.device)
     kl = kv_lens.tolist()  # the ONE documented D2H sync of this engine
     ksl = row_starts.tolist() if windowed else None
     if ws is None:
@@ -2849,6 +2874,9 @@ def run_varlen(
             pt = page_table[req].to(torch.int64)
             phys = (pt[(rr >> page_shift).clamp_min(0)] << page_shift) | (rr & ((1 << page_shift) - 1))
             idx[r] = torch.where(rr >= 0, phys, rr).to(_I32)
+    if vals_out is not None:
+        vals_out.copy_(vals)
+        vals_out.masked_fill_(idx < 0, torch.finfo(_BF16).min)
 
 
 __all__ = [
@@ -2887,6 +2915,7 @@ def warmup_varlen(
     num_rows_list: Sequence[int] = (1,),
     row_stride: int | None = None,
     page_size: int | None = None,
+    dtype: torch.dtype = torch.float32,
 ) -> None:
     """TESTING/INIT ONLY — compile the varlen engine's envelope tuples.
 
@@ -2907,7 +2936,13 @@ def warmup_varlen(
     ``page_size`` additionally compiles the PAGED hint-free engines and
     launchers for that page size (``run_varlen(page_table=..., page_size=)``
     is a distinct compiled set per page size).
+
+    ``dtype`` is the logits dtype the serving calls will pass (``torch.float32``
+    or ``torch.bfloat16``): each dtype is a distinct compiled set.
     """
+    if dtype is not _F32 and dtype is not _BF16:
+        raise RuntimeError(f"dtype must be torch.float32 or torch.bfloat16, got {dtype}")
+    bf16 = dtype is _BF16
     page_shift = None
     if page_size is not None:
         ps = int(page_size)
@@ -2985,6 +3020,8 @@ def warmup_varlen(
         npad,
         page_shift,
     )
+    if bf16:
+        key = key + ("bf16",)
     n_env_l = min(max(int(max_seq_len) >> (0 if int(compress_ratio) == 1 else 2), 1), npad)
     with _VARLEN_WARMUP_LOCK:
         bands_done = key in _VARLEN_WARMUP_DONE
@@ -2997,10 +3034,12 @@ def warmup_varlen(
         # count misses the launcher cache.
         for r in req_rows:
             for hf in (False, True):
-                _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf)
+                _varlen_launcher(
+                    r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf, bf16=bf16
+                )
             if page_shift is not None:
                 _varlen_launcher(
-                    r, npad, int(top_k), n_env_l, nn, int(compress_ratio), True, page_shift
+                    r, npad, int(top_k), n_env_l, nn, int(compress_ratio), True, page_shift, bf16
                 )
         return
     rows_max = rows_list[-1]
@@ -3009,7 +3048,7 @@ def warmup_varlen(
     # hinted and the hint-free engines are compiled: they are distinct
     # compiled objects and a serving stack may use either (``auto`` picks
     # hint-free whenever the caller passes no previous-step indices).
-    logits = torch.zeros((rows_max, npad), dtype=torch.float32, device=dev)
+    logits = torch.zeros((rows_max, npad), dtype=dtype, device=dev)
     kv_lens = torch.full((rows_max // nn,), int(max_seq_len), dtype=torch.int32, device=dev)
     pre_idx = torch.zeros((rows_max // nn, int(top_k)), dtype=torch.int32, device=dev)
     out = torch.empty((rows_max, int(top_k)), dtype=torch.int32, device=dev)
@@ -3052,10 +3091,10 @@ def warmup_varlen(
     # CUDA-graph capture at any requested geometry finds its key immediately.
     for r in req_rows:
         for hf in (False, True):
-            _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf)
+            _varlen_launcher(r, npad, int(top_k), n_env_l, nn, int(compress_ratio), hf, bf16=bf16)
         if page_shift is not None:
             _varlen_launcher(
-                r, npad, int(top_k), n_env_l, nn, int(compress_ratio), True, page_shift
+                r, npad, int(top_k), n_env_l, nn, int(compress_ratio), True, page_shift, bf16
             )
     with _VARLEN_WARMUP_LOCK:
         _VARLEN_WARMUP_DONE.add(key)
